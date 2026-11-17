@@ -1,0 +1,33 @@
+# Git
+.git/
+.gitignore
+
+# Dev environment
+.devcontainer/
+.vscode/
+.claude/
+
+# Python caches
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+.uv/
+
+# Data files — mounted as a volume at runtime, not baked into the image.
+# Excludes the large SQLite DB, Chroma vector stores, raw input docs, and archives.
+data/
+
+# Docs and scripts not needed at runtime
+docs/
+scripts/
+external/
+db/
+
+# Environment files with secrets
+.env
+*.env
+
+# Misc
+*.md
+*.sh

@@ -1,0 +1,161 @@
+name: CI Chatbot
+
+# Test on pull requests into the default branch (main or dev-v2), and on it once
+# commits land, so the commit a release tag points at carries a CI Chatbot
+# run of its own.
+# Path-filtered to the chatbot backend, frontend, its tests, and the
+# packaging/image inputs.
+on:
+  push:
+    branches: [dev-v2, main]
+    paths:
+      - 'src/sme_chatbot/**'
+      - 'frontends/**'
+      - 'tests/unit/**'
+      - 'tests/backend_api/**'
+      - 'pyproject.toml'
+      - 'uv.lock'
+      - 'Dockerfile'
+      - '.github/workflows/ci-chatbot.yml'
+  pull_request:
+    branches: [dev-v2, main]
+    paths:
+      - 'src/sme_chatbot/**'
+      - 'frontends/**'
+      - 'tests/unit/**'
+      - 'tests/backend_api/**'
+      - 'pyproject.toml'
+      - 'uv.lock'
+      - 'Dockerfile'
+      - '.github/workflows/ci-chatbot.yml'
+
+permissions:
+  contents: read
+
+# Newer pushes to the same PR supersede in-flight runs (platform convention).
+# Pushes to main/dev-v2 get a per-commit group and are never cancelled: each
+# such commit needs its own verdict for the release pre-flight to be able to
+# read one.
+concurrency:
+  group: ci-chatbot-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  # Pin = the version the dev environment runs today (verified 2026-07-08:
+  # `uv --version` -> 0.11.26, and https://astral.sh/uv/0.11.26/install.sh
+  # resolves). Bump deliberately.
+  UV_VERSION: "0.11.26"
+
+jobs:
+  test:
+    name: Lock check & Test
+    # Pinned (not ubuntu-latest): the label migrates to Ubuntu 26 on
+    # 2026-10-19 (github.com/actions/runner-images#14748). Bump
+    # deliberately once the project is verified to work there.
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Install uv (pinned)
+        run: |
+          curl -LsSf "https://astral.sh/uv/${UV_VERSION}/install.sh" | sh
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Verify lockfile is up to date
+        run: uv lock --check
+
+      - name: Sync (frozen, incl. dev group)
+        run: uv sync --frozen
+
+      - name: Run credential-free suites
+        run: uv run pytest tests/unit tests/backend_api -v
+
+  docker-smoke:
+    name: Docker build smoke (image inputs changed, ${{ matrix.platform }})
+    # Pinned — see comment on the `test` job above.
+    runs-on: ubuntu-24.04
+    needs: test
+    # One job (and runner) per platform. Building both in one `buildx` call
+    # most likely ran the runner out of disk: it starts ~83% full and the
+    # arm64 leg alone takes it past 90%. On 470f840 that combined build died
+    # mid-build three times with no log, while each platform alone passed. The timeout makes a hang end the job with its log kept,
+    # instead of running into GitHub's 6-hour default.
+    timeout-minutes: 35
+    strategy:
+      fail-fast: false
+      matrix:
+        # Target platforms for the smoke build — keep in step with
+        # release-chatbot.yml's PLATFORMS and its `build` matrix, which
+        # build the same way, one runner per platform.
+        platform: [linux/amd64, linux/arm64]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Skip unless image inputs changed
+        id: gate
+        env:
+          BASE_REF: ${{ github.base_ref }}
+          BEFORE_SHA: ${{ github.event.before }}
+        run: |
+          set -euo pipefail
+          if [ "$GITHUB_EVENT_NAME" = "pull_request" ]; then
+            git fetch origin "$BASE_REF" --depth=1
+            RANGE="origin/${BASE_REF}...HEAD"
+          elif [ -n "${BEFORE_SHA:-}" ] \
+               && [ "$BEFORE_SHA" != "0000000000000000000000000000000000000000" ] \
+               && git cat-file -e "${BEFORE_SHA}^{commit}" 2>/dev/null; then
+            RANGE="${BEFORE_SHA}..HEAD"
+          else
+            # First push, force-push, or an unreachable "before" — no usable
+            # range, so build rather than silently skip the smoke test.
+            echo "build=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          # Herestring, not a pipe: `grep -q` exits on first match, and under
+          # `pipefail` git's resulting SIGPIPE would mask a genuine hit.
+          CHANGED="$(git diff --name-only "$RANGE")"
+          # This workflow counts too: a change to the build job below should
+          # be proven by running it.
+          if grep -qE '^(Dockerfile|pyproject\.toml|uv\.lock|\.github/workflows/ci-chatbot\.yml)$' <<<"$CHANGED"; then
+            echo "build=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "build=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Set up QEMU (arm64 emulation for the smoke build)
+        if: steps.gate.outputs.build == 'true' && matrix.platform == 'linux/arm64'
+        uses: docker/setup-qemu-action@v4
+
+      - name: Set up Docker Buildx
+        if: steps.gate.outputs.build == 'true'
+        uses: docker/setup-buildx-action@v4
+
+      - name: Build image for ${{ matrix.platform }} (no push — smoke only)
+        if: steps.gate.outputs.build == 'true'
+        # Never pushed. The amd64 image is --load-ed for the offline-model
+        # check below; the arm64 one is discarded (QEMU-emulated, and loading
+        # it would add disk pressure on a runner that is already tight).
+        env:
+          PLATFORM: ${{ matrix.platform }}
+        run: |
+          LOAD=()
+          if [ "$PLATFORM" = "linux/amd64" ]; then LOAD=(--load); fi
+          docker buildx build "${LOAD[@]}" \
+            --platform "${PLATFORM}" \
+            -t "sme-chatbot:ci-${{ github.event.pull_request.number || github.sha }}" .
+
+      # The model must be baked into the runtime image, not left in
+      # the builder stage. No network, so a missing model fails here instead of
+      # being downloaded on the first request; HF_HUB_OFFLINE makes that
+      # failure immediate rather than a timeout. amd64 only: the arm64 image
+      # is the same Dockerfile, and is not loaded (see above).
+      - name: Embedding model loads offline from the image
+        if: steps.gate.outputs.build == 'true' && matrix.platform == 'linux/amd64'
+        run: |
+          docker run --rm --network none -e HF_HUB_OFFLINE=1 \
+            "sme-chatbot:ci-${{ github.event.pull_request.number || github.sha }}" \
+            python -c "from sentence_transformers import SentenceTransformer as S; print(S('paraphrase-multilingual-MiniLM-L12-v2').encode(['smoke']).shape)"

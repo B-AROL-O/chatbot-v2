@@ -1,0 +1,80 @@
+// Alloy agent for the chatbot: ships this stack's container logs to the
+// shared Loki at LOKI_URL (set in .env).
+//
+// Adapted from external/observability/docs/guides/connect-an-application.md
+// (Option A, validated against grafana/alloy:v1.20.1). Logs only, for now:
+// the application does not export OTLP yet, so the guide's
+// metrics/traces pipelines are left out until it does.
+//
+// Validate before restarting:
+//   docker run --rm -v "$PWD/alloy:/etc/alloy:ro" grafana/alloy:v1.20.1 validate /etc/alloy
+
+logging {
+  level  = "info"
+  format = "logfmt"
+}
+
+// --- Logs: this stack's containers only -----------------------------------
+//
+// Deliberate departure from the guide, which ships every container on the
+// host: the deploy host runs other workloads, and in the shared tenant `job` is
+// the only thing separating streams. A container opts in with the label
+// com.sme-chatbot.telemetry.job=chatbot (set in docker-compose.yml).
+
+discovery.docker "containers" {
+  host = "unix:///var/run/docker.sock"
+
+  filter {
+    name   = "label"
+    values = ["com.sme-chatbot.telemetry.job=chatbot"]
+  }
+}
+
+discovery.relabel "containers" {
+  targets = discovery.docker.containers.targets
+
+  // Docker reports the name with a leading slash.
+  rule {
+    source_labels = ["__meta_docker_container_name"]
+    regex         = "/(.*)"
+    target_label  = "container"
+  }
+
+  // chatbot-api / chatbot-gradio / alloy: stable across recreates, unlike
+  // the container name, and low-cardinality. Not named `service`: Loki
+  // derives service_name from a label of that name.
+  rule {
+    source_labels = ["__meta_docker_container_label_com_docker_compose_service"]
+    target_label  = "compose_service"
+  }
+}
+
+loki.source.docker "containers" {
+  host       = "unix:///var/run/docker.sock"
+  targets    = discovery.relabel.containers.output
+  // service_name must equal job (the guide's contract), or trace-to-log
+  // correlation never resolves. Set explicitly: left alone, Loki derives it
+  // from the container name. job/service_name/brand follow the shared
+  // Loki's naming convention: the product name in job, the brand beside it, so
+  // a future per-brand deployment is a new label value, not a new job.
+  labels     = { job = "chatbot", service_name = "chatbot", brand = sys.env("LOKI_BRAND") }
+  forward_to = [loki.write.ingest.receiver]
+}
+
+loki.write "ingest" {
+  endpoint {
+    url = sys.env("LOKI_URL")
+
+    basic_auth {
+      username = sys.env("INGEST_USERNAME")
+      password = sys.env("INGEST_PASSWORD")
+    }
+  }
+
+  // env must be exactly dev | staging | prod: Loki retention and the
+  // dashboards key on it, and any other value falls through silently.
+  external_labels = {
+    env      = sys.env("ALLOY_ENV"),
+    hostname = sys.env("HOSTNAME_LABEL"),
+  }
+}

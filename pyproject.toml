@@ -1,0 +1,81 @@
+[project]
+name = "sme-chatbot"
+# Fixed placeholder — never bumped, and not the release version. The release
+# tag IS the version (see docs/procedures/release-chatbot.md); the running
+# app reports it via APP_VERSION at GET /health and in the OpenAPI
+# info.version, and the image carries it as an OCI label.
+# `0.0.0` is the conventional never-a-real-release value: it makes
+# `importlib.metadata.version("sme-chatbot")` / `pip show` obviously a
+# placeholder rather than a plausible-but-stale number.
+version = "0.0.0"
+description = "SME Chatbot: FastAPI backend and Gradio frontend for chatting over a company's own data (RAG + SQL tool calling)"
+requires-python = ">=3.13"
+dependencies = [
+    "chromadb>=1.0.0",
+    "fastapi>=0.115",
+    "gradio>=6.18.0",
+    "httpx>=0.27",
+    "langfuse>=4.14.0",
+    "msal>=1.37.0",
+    "openai>=2.41.1",
+    "openpyxl>=3.1",
+    # PyMuPDF 2.x ships the `pymupdf4llm` module inside the `pymupdf` wheel;
+    # the `pymupdf4llm` 2.x distribution on PyPI is an empty shim with no
+    # dependencies, so depending on it alone installs neither module.
+    "pymupdf>=2.0",
+    "pytest>=9.1.1",
+    "python-docx>=1.1",
+    "python-dotenv>=1.2.2",
+    "python-jose[cryptography]>=3.3",
+    "requests>=2.32",
+    "sentence-transformers>=3.0.0",
+    "sse-starlette>=2.1",
+    # Pinned as a direct dependency (transitively required by
+    # sentence-transformers) solely so `[tool.uv.sources]` below can redirect
+    # it to the CPU-only wheel index — see the comment there.
+    "torch>=2.0",
+    "uvicorn>=0.30",
+]
+
+[project.scripts]
+sme-chatbot-api = "sme_chatbot.api.main:cli"
+sme-chatbot-eval = "sme_chatbot.eval.cli:main"
+sme-chatbot-eval-retrieval = "sme_chatbot.eval.retrieval:main"
+sme-chatbot-eval-trend = "sme_chatbot.eval.trend:main"
+sme-ingest-docsvc = "sme_chatbot.ingestion.ingest_docsvc:main"
+
+[dependency-groups]
+dev = [
+    "httpx2>=2.9.1",
+    "pytest>=8.0",
+    "pytest-asyncio>=0.24",
+    "respx>=0.21",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/sme_chatbot"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "ratelimit: tests that exercise API rate-limiting behavior",
+]
+
+# CPU-only PyTorch: sentence-transformers pulls in torch transitively (for the
+# embedding model used by cdo_rag/manuals_rag/docsvc_rag). The default PyPI
+# Linux wheel bundles CUDA runtime libraries (~2 GB of nvidia-* packages) that
+# this project never uses — inference-only, no GPU. Point torch at the
+# official CPU-only wheel index so `uv sync`/`uv lock` (and the Docker image
+# built from it) stay small. See:
+# https://docs.astral.sh/uv/guides/integration/pytorch/#configuring-cpu-only-pytorch
+[tool.uv.sources]
+torch = [{ index = "pytorch-cpu" }]
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true

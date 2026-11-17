@@ -1,0 +1,118 @@
+# Project: chatbot-v2
+#
+# Sample Docker Compose file
+#
+# Details at https://github.com/B-AROL-O/chatbot-v2
+
+# Release image; set CHATBOT_IMAGE to pin a version, e.g.
+# CHATBOT_IMAGE=ghcr.io/b-arol-o/chatbotv2:<version>
+x-chatbot-image: &chatbot-image ${CHATBOT_IMAGE:-ghcr.io/b-arol-o/chatbotv2:latest}
+
+services:
+
+  # ── Chatbot backend (FastAPI) ───────────────────────────────────────────
+  # Owns all RAG/chat logic: /health, POST /chat/message (SSE streaming).
+  # See docs/specs/2026-07-02-backend-split-and-docsvc-ingestion-plan.md §4.1.
+  #
+  # Future: a .NET web portal will proxy to this service instead of (or
+  # alongside) chatbot-gradio — see ADR 0001. Not implemented here;
+  # this compose file only stands up the two services this repo owns.
+  chatbot-api:
+    image: *chatbot-image
+    build: .
+    ports:
+      - "8000:8000"
+    env_file:
+      - path: .env
+        required: false
+    volumes:
+      # data/ must be populated by the ETL + ingest scripts before starting
+      # (see README.md "Quickstart").
+      - ./data:/app/data
+    labels:
+      # Opt-in for the alloy log shipper below (alloy/client.alloy).
+      com.sme-chatbot.telemetry.job: chatbot
+    restart: unless-stopped
+
+  # ── Chatbot frontend (Gradio) ───────────────────────────────────────────
+  # Thin HTTP/SSE client of chatbot-api (frontends/gradio_app.py) — no RAG
+  # logic lives here. Reuses the backend image; only the command differs.
+  # UI available at http://localhost:7860
+  chatbot-gradio:
+    image: *chatbot-image
+    build: .
+    # No `uv run` needed at runtime: the image's venv is already fully
+    # synced and its bin/ is on PATH (see Dockerfile), so the venv's own
+    # python is used directly.
+    command: python frontends/gradio_app.py
+    ports:
+      - "7860:7860"
+    environment:
+      - CHATBOT_API_URL=http://chatbot-api:8000
+      - GRADIO_SERVER_NAME=0.0.0.0
+      - GRADIO_SERVER_PORT=7860
+    env_file:
+      - path: .env
+        required: false
+    # The image's HEALTHCHECK probes the backend on :8000, which this
+    # container doesn't serve: probe Gradio's own :7860 instead. GET /config
+    # is served by Gradio itself and answers even while the backend is down,
+    # so this reports the frontend's health, not the backend's.
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - import urllib.request; urllib.request.urlopen('http://localhost:7860/config', timeout=4)
+      interval: 30s
+      timeout: 5s
+      start_period: 30s
+      retries: 3
+    # Wait for the backend's HEALTHCHECK (GET /health), not just for its
+    # container to exist.
+    depends_on:
+      chatbot-api:
+        condition: service_healthy
+    labels:
+      # Opt-in for the alloy log shipper below (alloy/client.alloy).
+      com.sme-chatbot.telemetry.job: chatbot
+    restart: unless-stopped
+
+  # ── Log shipper (Grafana Alloy) — opt-in, profile "observability" ──────
+  # Ships the logs of this stack's containers (those labelled
+  # com.sme-chatbot.telemetry.job=chatbot) to the shared Loki at
+  # LOKI_URL (set in .env), under job="chatbot". Setup and
+  # verification in docs/procedures/docker-deployment.md "Shipping logs to
+  # Loki". Not started by a plain `docker compose up` — enable it with
+  # COMPOSE_PROFILES=observability in .env. The ./alloy directory must sit
+  # next to this file on the host.
+  alloy:
+    image: grafana/alloy:v1.20.1
+    profiles: [observability]
+    command: [run, /etc/alloy, --storage.path=/var/lib/alloy]
+    volumes:
+      - ./alloy:/etc/alloy:ro
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      # Read positions: after an outage or restart the agent catches up
+      # instead of dropping or re-sending lines.
+      - alloy-data:/var/lib/alloy
+    environment:
+      # Set in .env (see .env.example). No `:?` guards here: compose checks
+      # them even when this profile is off, which would break a plain
+      # `docker compose up`. Missing credentials show up as 401 in
+      # `docker compose logs alloy` instead.
+      # ALLOY_ENV must be exactly dev | staging | prod (Loki retention keys on it).
+      ALLOY_ENV: ${ALLOY_ENV:-prod}
+      HOSTNAME_LABEL: ${HOSTNAME_LABEL:-}
+      LOKI_BRAND: ${LOKI_BRAND:-acme}
+      LOKI_URL: ${LOKI_URL:-}
+      INGEST_USERNAME: ${INGEST_USERNAME:-}
+      INGEST_PASSWORD: ${INGEST_PASSWORD:-}
+    labels:
+      com.sme-chatbot.telemetry.job: chatbot
+    restart: unless-stopped
+
+volumes:
+  alloy-data:
+
+# EOF

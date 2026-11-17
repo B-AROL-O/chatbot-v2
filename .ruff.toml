@@ -1,0 +1,62 @@
+# Repo-level ruff configuration — the single source of truth for Python lint.
+#
+# .github/workflows/super-linter.yml points super-linter's ruff at this exact
+# file (PYTHON_RUFF_CONFIG_FILE), so what CI enforces and what a local ruff run
+# reports are the same thing. Without it the two diverge: the pinned
+# super-linter image and a current local ruff ship different default rule sets,
+# which cost several CI round-trips per PR.
+#
+# Reproduce CI exactly:  uvx ruff check .
+
+# Vendored/third-party checkouts mounted here are not ours to lint.
+exclude = ["external"]
+# Honour `exclude` even when a caller passes file paths explicitly, which is
+# how super-linter invokes ruff.
+force-exclude = true
+
+# Super-linter's template value; keeps diffs stable if this file is ever removed.
+line-length = 120
+
+# pyproject.toml says requires-python = ">=3.13"; state it here too, since this
+# file (not pyproject.toml) is what ruff reads, and the UP rules key off it.
+target-version = "py313"
+
+[lint]
+select = [
+    "E4",      # pycodestyle — imports (E401/E402). Part of ruff's default set.
+    "E7",      # pycodestyle — statement-level errors. Default set.
+    "E9",      # pycodestyle — syntax/IO errors. Default set.
+    "F",       # pyflakes — unused imports/names, undefined names. Default set.
+    "I",       # isort — import ordering, autofixable.
+    "B",       # flake8-bugbear — real bug shapes (notably B023 loop-variable capture).
+    "SIM",     # flake8-simplify — reduces branching noise.
+    "UP",      # pyupgrade — keeps us on current stdlib idioms for our Python floor.
+    "PLW1510", # subprocess.run without check= — a failing subprocess must not pass silently.
+    "RUF100",  # no dead `# noqa` directives; a suppression must suppress something real.
+]
+
+ignore = [
+    "E203", # whitespace before ':' — conflicts with formatters. Super-linter ignores it too.
+]
+
+# Deliberately NOT selected:
+#
+#   BLE001 (blind-except) — this codebase catches bare `Exception` in ~13 places
+#   on purpose: ingestion and RAG paths degrade per-item rather than aborting a
+#   whole run, and every one carries a comment saying so. Enabling the rule would
+#   mean 13 `# noqa` directives that document nothing the comment above them does
+#   not already say. If that policy ever changes, enable it here rather than
+#   sprinkling suppressions.
+
+[lint.flake8-bugbear]
+# FastAPI's dependency-injection idiom is a call in an argument default; that is
+# the framework's documented API, not the B008 mutable-default bug.
+extend-immutable-calls = ["fastapi.Depends", "fastapi.Query", "fastapi.Header"]
+
+[lint.per-file-ignores]
+# Both ingestion CLIs print a "loading dependencies, this takes ~30s" banner
+# and only then import torch / sentence-transformers. The banner exists so the
+# user sees something during that 30s import, so the imports must stay below
+# it — E402 here is the design, not an oversight.
+"ingest_sample_cdo.py" = ["E402"]
+"ingest_sample_manuals.py" = ["E402"]

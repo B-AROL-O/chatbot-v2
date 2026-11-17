@@ -1,0 +1,8 @@
+ID,required,forbidden,note
+Q05,,2 teste,"Comportamento atteso: 2 è il numero di richiamo della legenda, non il conteggio"
+Q07,,315,Comportamento atteso: 315 Nm è la risposta sbagliata tipica
+Q26,cartuccia,,Comportamento atteso: deve includere la cartuccia del lubrificante
+Q28,orientatore|disco|camma|avvitamento,,"Risposta attesa: le tappe del ciclo; la rubrica verifica la copertura, non l'ordine"
+Q30,M24,,Risposta attesa: le tabelle si fermano a M24; su una voce Non rispondibile gli anchor sono la giustificazione
+Q31,TC-200,,Risposta attesa: la 90001 monta teste TC-200
+Q33,orario,,Risposta attesa: il senso di rotazione è orario; niente forbidden antiorario

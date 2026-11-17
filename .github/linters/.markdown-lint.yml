@@ -1,0 +1,48 @@
+---
+###########################
+###########################
+## Markdown Linter rules ##
+###########################
+###########################
+
+# Linter rules doc:
+# - https://github.com/DavidAnson/markdownlint
+#
+# Note:
+# To comment out a single error:
+#   <!-- markdownlint-disable -->
+#   any violations you want
+#   <!-- markdownlint-restore -->
+#
+
+###############
+# Rules by id #
+###############
+MD004: false # Unordered list style
+MD007:
+  indent: 2 # Unordered list indentation
+MD013:
+  line_length: 400 # Line length 80 is far too short
+  tables: false # Table rows cannot be wrapped without breaking the table
+MD026:
+  punctuation: ".,;:!。，；:" # List of not allowed
+MD029: false # Ordered list item prefix
+MD033: false # Allow inline HTML
+MD036: false # Emphasis used instead of a heading
+
+#################
+# Rules by tags #
+#################
+blank_lines: false # Error on blank lines
+
+##########################################
+# Repo additions on top of the template  #
+##########################################
+
+# MD060's default (`any`) infers each table's style from its first row pair,
+# so a header and delimiter row that happen to be the same width flip the whole
+# table into "aligned" mode and demand every pipe line up. Pin the style
+# instead: `compact` is one space either side of each pipe, which is what
+# markdownlint's own --fix produces.
+MD060:
+  style: "compact"

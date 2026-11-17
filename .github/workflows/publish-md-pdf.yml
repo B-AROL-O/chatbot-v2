@@ -1,0 +1,68 @@
+---
+name: Publish Markdown as PDF
+
+on:
+  workflow_dispatch:
+    inputs:
+      markdown_files:
+        description: >-
+          Space-separated list of Markdown files to convert
+          (e.g., 'docs/procedures/file1.md docs/procedures/file2.md')
+        required: false
+        default: 'docs/procedures/generate-pdf-from-markdown.md'
+  pull_request:
+    paths:
+      - 'docs/**/*.md'
+      - '.github/workflows/publish-md-pdf.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  convert:
+    name: Convert Markdown to PDF
+    # Pinned (not ubuntu-latest): the label migrates to Ubuntu 26 on
+    # 2026-10-19 (github.com/actions/runner-images#14748). Bump
+    # deliberately once the project is verified to work there.
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Determine markdown files
+        id: files
+        run: |
+          if [ -n "${{ github.event.inputs.markdown_files }}" ]; then
+            FILES="${{ github.event.inputs.markdown_files }}"
+          else
+            # For PR trigger: find all modified .md files in docs/
+            if [ "${{ github.event_name }}" = "pull_request" ]; then
+              FILES=$(git diff --name-only \
+                ${{ github.event.pull_request.base.sha }}..HEAD \
+                -- 'docs/**/*.md' | tr '\n' ' ')
+              if [ -z "$FILES" ]; then
+                echo "No Markdown files changed in docs/ folder"
+                echo "files=" >> "$GITHUB_OUTPUT"
+              else
+                echo "files=$FILES" >> "$GITHUB_OUTPUT"
+              fi
+            else
+              echo "files=" >> "$GITHUB_OUTPUT"
+            fi
+          fi
+
+      - name: Convert Markdown to PDF
+        if: steps.files.outputs.files != ''
+        uses: B-AROL-O/publish-md-pdf@main
+        with:
+          files: ${{ steps.files.outputs.files }}
+          output-dir: ./pdf-output
+          css-file: scripts/publish-md-pdf.css
+
+      - name: Upload PDFs as artifact
+        if: always() && steps.files.outputs.files != ''
+        uses: actions/upload-artifact@v7
+        with:
+          name: generated-pdfs
+          path: pdf-output/
+          retention-days: 7

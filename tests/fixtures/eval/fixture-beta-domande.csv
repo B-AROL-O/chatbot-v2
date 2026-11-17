@@ -1,0 +1,3 @@
+ID,Famiglia,Scope,Matricola,Costruttore,Lingua,Categoria,Difficoltà (1-3),Domanda,Risposta attesa,Comportamento atteso,Capitolo fonte,Pag. stampata,Documento,Risposta corretta? (S/N/P),Fonti corrette? (S/N),Ha citato? (S/N),Note esito,Trace Langfuse
+Q101,Q101,nuda,90002,ACME-BETA,IT,Identificazione,1,Chi è il costruttore della 90002?,ACME Beta S.r.l.,Una risposta ACME indica un costruttore unico assunto per tutto il corpus.,1.1,2,90002_manual_IT.pdf,,,,,
+Q102,Q102,nuda,90002,ACME-BETA,IT,Dato tecnico semplice,1,Quanto pesa la 90002?,850 kg.,Risposta diretta.,3.1,12,90002_manual_IT.pdf,,,,,

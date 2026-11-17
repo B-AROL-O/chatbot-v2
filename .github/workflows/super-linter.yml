@@ -1,0 +1,81 @@
+name: Super-Linter
+
+# Lint every PR and push to the default branch (main or dev-v2).
+# Path-unfiltered (unlike ci-chatbot.yml) since this covers repo-wide file
+# types: YAML, JSON, Markdown, Bash, Dockerfile, GitHub Actions syntax, and —
+# the original motivation for this workflow — secrets
+# accidentally committed to the repo (VALIDATE_GITLEAKS below).
+on:
+  pull_request:
+    branches: [dev-v2, main]
+  push:
+    branches: [dev-v2, main]
+
+permissions:
+  contents: read
+
+# Newer pushes to the same PR/branch supersede in-flight runs (platform convention).
+concurrency:
+  group: super-linter-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  super-linter:
+    name: Lint
+    # Pinned (not ubuntu-latest): the label migrates to Ubuntu 26 on
+    # 2026-10-19 (github.com/actions/runner-images#14748). Bump
+    # deliberately once the project is verified to work there.
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      statuses: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Super-Linter
+        # Pin = the latest release at the time this workflow was added
+        # (verified 2026-07-17: https://github.com/super-linter/super-linter
+        # releases v8.7.0). Bump deliberately.
+        uses: super-linter/super-linter@v9.0.0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          # Lint the whole codebase, not just the files a PR happens to touch.
+          #
+          # This used to be false, which meant pre-existing violations stayed
+          # invisible until someone edited the file — and then landed on that
+          # PR's author for a problem they did not create. The repo was made lint-clean under these settings
+          # before this was flipped, so the gate now reports the repo's real
+          # state instead of an accident of the changed-file set.
+          VALIDATE_ALL_CODEBASE: true
+
+          # Setting any VALIDATE_<LANGUAGE> flag switches super-linter from
+          # "run everything" to "run only what's explicitly set to true" —
+          # so only the linters listed below run; everything else is off.
+
+          # Secret scanning: the original motivation for this workflow.
+          VALIDATE_GITLEAKS: true
+
+          # File types actually present in this repo.
+          VALIDATE_PYTHON_RUFF: true
+          VALIDATE_YAML: true
+          VALIDATE_JSON: true
+          VALIDATE_MARKDOWN: true
+          VALIDATE_BASH: true
+          VALIDATE_BASH_EXEC: true
+          VALIDATE_DOCKERFILE_HADOLINT: true
+          VALIDATE_GITHUB_ACTIONS: true
+          VALIDATE_ENV: true
+
+          # Point ruff at the repo-root .ruff.toml. Super-linter resolves this
+          # against LINTER_RULES_PATH (.github/linters), so "../../" lands back
+          # on ./.ruff.toml — the very file a local `uvx ruff check` reads.
+          # CI and local runs then enforce one rule set instead of two, which
+          # is what turned lint fixes into multi-round-trip guesswork.
+          # LINTER_RULES_PATH itself stays put: .github/linters/.markdown-lint.yml
+          # lives there and markdownlint must keep finding it.
+          PYTHON_RUFF_CONFIG_FILE: ../../.ruff.toml

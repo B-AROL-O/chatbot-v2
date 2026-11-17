@@ -1,0 +1,261 @@
+name: Release Chatbot
+
+# Triggered when a release tag is pushed (create it via the GitHub Releases UI).
+# The tag IS the version — no version file. (Platform convention.)
+#
+# Tag prefix is chatbotv2/v (see TAG_PREFIX).
+on:
+  push:
+    tags:
+      - 'chatbotv2/v*'
+
+permissions:
+  contents: write     # create/update the Release
+  packages: write     # push to GHCR (ghcr.io)
+
+env:
+  UV_VERSION: "0.11.26"      # keep in lockstep with ci-chatbot.yml (see comment there)
+  TAG_PREFIX: chatbotv2/v
+  IMAGE_NAME: chatbotv2   # -> ghcr.io/<repo-owner>/chatbotv2, i.e. ghcr.io/b-arol-o/chatbotv2
+  # Platforms of the released image. Each one builds in its own `build`
+  # matrix job — keep this list and that matrix in step.
+  PLATFORMS: "linux/amd64,linux/arm64"
+  # Shown on the GHCR package page. For a multi-arch image GHCR reads it from
+  # the index's annotations, not from the image labels. It is set twice: in
+  # `publish` on the tagged index, and in `build` on each per-platform push,
+  # which GHCR lists as an untagged version with a page of its own (a
+  # per-platform push is itself an index: the image plus its provenance).
+  IMAGE_DESCRIPTION: "SME Chatbot: FastAPI backend and Gradio frontend for chatting over a company's own data (RAG + SQL tool calling)"
+
+jobs:
+  # Three stages, one runner per platform. The earlier release built
+  # both platforms in one `buildx` call on one runner and hung for 6h without
+  # a log. ci-chatbot.yml's smoke build hit the same wall: the runner
+  # starts ~83% full and the arm64 leg alone takes it past 90%, so the
+  # combined build ran out of disk. Each platform now builds on its own
+  # runner and is pushed by digest; `publish` joins the digests under the
+  # version tag, then creates the Release, so a failed platform leaves
+  # neither a half-tagged image nor a Release.
+  prepare:
+    name: Validate & Test
+    # Pinned (not ubuntu-latest): the label migrates to Ubuntu 26 on
+    # 2026-10-19 (github.com/actions/runner-images#14748). Bump
+    # deliberately once the project is verified to work there.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    outputs:
+      version: ${{ steps.ver.outputs.version }}
+      prerelease: ${{ steps.ver.outputs.prerelease }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0     # full tag history for the monotonic check
+
+      - name: Validate tag & parse version
+        id: ver
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          # MAJOR.MINOR.PATCH with an optional semver-style pre-release suffix,
+          # e.g. chatbotv2/v0.3.0 or chatbotv2/v0.3.0-alpha.1, chatbotv2/v0.3.0-rc.2.
+          if [[ ! "$TAG" =~ ^chatbotv2/v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z][0-9A-Za-z.-]*)?$ ]]; then
+            echo "::error::Tag '$TAG' must match chatbotv2/vMAJOR.MINOR.PATCH[-prerelease], e.g. chatbotv2/v1.2.3 or chatbotv2/v1.2.3-rc.1"
+            exit 1
+          fi
+          VERSION="${TAG#"${TAG_PREFIX}"}"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          if [[ "$VERSION" == *-* ]]; then
+            echo "prerelease=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "prerelease=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Warn if version is not incremented
+        run: |
+          # sort -V does not fully understand semver pre-release ordering
+          # (e.g. 1.2.3-alpha vs 1.2.3), so this check is best-effort for
+          # pre-release tags — it will not false-positive on stable-vs-stable.
+          PREV=$(git tag -l 'chatbotv2/v*' --sort=-v:refname \
+                 | grep -vx "${GITHUB_REF_NAME}" | head -n1)
+          if [ -z "$PREV" ]; then
+            echo "No previous release tag — skipping monotonic check."; exit 0
+          fi
+          PREV_V="${PREV#"${TAG_PREFIX}"}"; NEW_V="${{ steps.ver.outputs.version }}"
+          HIGHEST=$(printf '%s\n%s\n' "$PREV_V" "$NEW_V" | sort -V | tail -n1)
+          if [ "$HIGHEST" = "$PREV_V" ] && [ "$PREV_V" != "$NEW_V" ]; then
+            echo "::warning::New version $NEW_V is not greater than latest released $PREV_V."
+          fi
+
+      - name: Install uv (pinned)
+        run: |
+          curl -LsSf "https://astral.sh/uv/${UV_VERSION}/install.sh" | sh
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Test gate
+        run: |
+          uv sync --frozen
+          uv run pytest tests/unit tests/backend_api
+
+  build:
+    name: Build & push (${{ matrix.platform }})
+    needs: prepare
+    # Pinned — see `prepare`.
+    runs-on: ubuntu-24.04
+    # The arm64 leg runs under QEMU: ~20 min in ci-chatbot.yml's smoke build.
+    # The timeout ends a hang with its log kept, instead of GitHub's 6h
+    # default.
+    timeout-minutes: 45
+    strategy:
+      fail-fast: true
+      matrix:
+        platform: [linux/amd64, linux/arm64]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Set up QEMU (arm64 emulation)
+        if: matrix.platform == 'linux/arm64'
+        uses: docker/setup-qemu-action@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      # ── Push to GHCR (GitHub Container Registry). GHCR is
+      # reachable from any github.com repo with no extra registry setup;
+      # GITHUB_TOKEN with `packages: write` (above) is sufficient to push. ──
+      - name: Log in to registry
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          REGISTRY="ghcr.io"
+          echo "$GH_TOKEN" | docker login "$REGISTRY" -u "$GITHUB_ACTOR" --password-stdin
+
+      - name: Disk before build
+        run: df -h /
+
+      - name: Build & push ${{ matrix.platform }} by digest
+        env:
+          PLATFORM: ${{ matrix.platform }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          set -euo pipefail
+          OWNER="$(echo "${GITHUB_REPOSITORY_OWNER}" | tr '[:upper:]' '[:lower:]')"
+          IMG="ghcr.io/${OWNER}/${IMAGE_NAME}"
+          # Untagged push: `publish` attaches the tags once every platform is
+          # in. --progress=plain keeps a readable log if the step hangs.
+          docker buildx build \
+            --progress=plain \
+            --platform "${PLATFORM}" \
+            --build-arg "APP_VERSION=${VERSION}" \
+            --label "org.opencontainers.image.version=${VERSION}" \
+            --label "org.opencontainers.image.revision=${GITHUB_SHA}" \
+            --label "org.opencontainers.image.source=${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}" \
+            --label "org.opencontainers.image.description=${IMAGE_DESCRIPTION}" \
+            --annotation "index,manifest:org.opencontainers.image.description=${IMAGE_DESCRIPTION}" \
+            --output "type=image,name=${IMG},push-by-digest=true,name-canonical=true,push=true" \
+            --metadata-file metadata.json .
+          DIGEST="$(jq -r '."containerimage.digest"' metadata.json)"
+          echo "Pushed ${IMG}@${DIGEST} (${PLATFORM})"
+          mkdir -p digests
+          touch "digests/${DIGEST#sha256:}"
+          echo "ARTIFACT=digest-${PLATFORM//\//-}" >> "$GITHUB_ENV"
+
+      - name: Disk after build
+        if: always()
+        run: df -h /
+
+      - name: Upload digest
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ env.ARTIFACT }}
+          path: digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  publish:
+    name: Tag image & create Release
+    needs: [prepare, build]
+    # Pinned — see `prepare`.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Download digests
+        uses: actions/download-artifact@v8
+        with:
+          path: digests
+          pattern: digest-*
+          merge-multiple: true
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Log in to registry
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          REGISTRY="ghcr.io"
+          echo "$GH_TOKEN" | docker login "$REGISTRY" -u "$GITHUB_ACTOR" --password-stdin
+
+      - name: Tag the multi-platform image
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+          PRERELEASE: ${{ needs.prepare.outputs.prerelease }}
+        run: |
+          set -euo pipefail
+          OWNER="$(echo "${GITHUB_REPOSITORY_OWNER}" | tr '[:upper:]' '[:lower:]')"
+          IMG="ghcr.io/${OWNER}/${IMAGE_NAME}"
+          EXPECTED="$(tr ',' '\n' <<<"${PLATFORMS}" | wc -l)"
+          FOUND="$(find digests -type f | wc -l)"
+          if [ "$FOUND" -ne "$EXPECTED" ]; then
+            echo "::error::Expected ${EXPECTED} platform digests (${PLATFORMS}), got ${FOUND}"
+            exit 1
+          fi
+          TAGS=(-t "${IMG}:${VERSION}")
+          # :latest tracks stable releases only — a pre-release must never
+          # become the default pull target.
+          if [ "${PRERELEASE}" = "false" ]; then
+            TAGS+=(-t "${IMG}:latest")
+          fi
+          SOURCES=()
+          for f in digests/*; do SOURCES+=("${IMG}@sha256:$(basename "$f")"); done
+          docker buildx imagetools create "${TAGS[@]}" \
+            --annotation "index:org.opencontainers.image.description=${IMAGE_DESCRIPTION}" \
+            "${SOURCES[@]}"
+          docker buildx imagetools inspect "${IMG}:${VERSION}"
+          # The summary above does not print index annotations, so read the
+          # raw index. A warning, not a failure: the image is already tagged,
+          # and a missing description is cosmetic.
+          GOT="$(docker buildx imagetools inspect --raw "${IMG}:${VERSION}" \
+                 | jq -r '.annotations["org.opencontainers.image.description"] // empty')"
+          if [ "$GOT" = "${IMAGE_DESCRIPTION}" ]; then
+            echo "Index description annotation: ${GOT}"
+          else
+            echo "::warning::${IMG}:${VERSION} has no index description annotation; the GHCR package page will show none."
+          fi
+
+      # ── Fallback (if Packages is ever disabled for this repo/org): archive on the Release ──
+      # A multi-arch manifest can't be `docker save`d directly — this would
+      # need its own single-platform `docker build` first if ever activated.
+      # - name: Save image archive
+      #   run: docker save "${IMAGE_NAME}:${{ needs.prepare.outputs.version }}" \
+      #        | gzip > "${IMAGE_NAME}-${{ needs.prepare.outputs.version }}.tar.gz"
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+          PRERELEASE: ${{ needs.prepare.outputs.prerelease }}
+        run: |
+          export GH_HOST="${GITHUB_SERVER_URL#https://}"
+          TAG="${GITHUB_REF_NAME}"
+          PRERELEASE_FLAG=""
+          if [ "${PRERELEASE}" = "true" ]; then
+            PRERELEASE_FLAG="--prerelease"
+          fi
+          if ! gh release view "$TAG" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release create "$TAG" -R "$GITHUB_REPOSITORY" \
+              --title "Chatbot ${VERSION}" \
+              --generate-notes $PRERELEASE_FLAG
+          fi
+          # Archive fallback additionally:
+          # gh release upload "$TAG" "${IMAGE_NAME}-${VERSION}.tar.gz" --clobber
