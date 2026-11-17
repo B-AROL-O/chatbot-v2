@@ -14,7 +14,7 @@
 # though the default CMD below never runs it.
 
 # ---- builder ---------------------------------------------------------------
-FROM python:3.14-slim AS builder
+FROM python:3.15-slim AS builder
 
 # Install uv from its official distroless image, pinned (tag + digest) to the
 # same version CI and the release workflow use (UV_VERSION in
@@ -49,7 +49,7 @@ RUN HF_TOKEN="${HF_TOKEN}" uv run python -c \
      SentenceTransformer('paraphrase-multilingual-MiniLM-L12-v2')"
 
 # ---- runtime -----------------------------------------------------------
-FROM python:3.14-slim AS runtime
+FROM python:3.15-slim AS runtime
 
 # antiword: converts legacy .doc files to text (used by ingestion scripts).
 # Version pinned to python:3.14-slim's current trixie candidate - bump
