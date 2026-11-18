@@ -114,6 +114,22 @@ Watch the run under **Actions → Release Chatbot**. On success:
 - The image is at `ghcr.io/b-arol-o/chatbotv2:0.3.0`
   (and `:latest` if it wasn't a pre-release).
 
+Then confirm the image pulls **anonymously** — a green run proves the push,
+not that anyone can pull it:
+
+```bash
+docker logout ghcr.io
+docker pull ghcr.io/b-arol-o/chatbotv2:0.3.0
+```
+
+`logout` first matters: a pull with your own stored credential succeeds even
+while the package is private, which hides the problem. If the pull says
+`unauthorized`, the package is not public yet — see
+[Making the package public](#making-the-package-public). Expect this on the
+**first release** to the package (and in a fork): GHCR creates the package
+private, whatever the repository's visibility. Visibility is set once per
+package; later releases keep it.
+
 ---
 
 ## Pulling the image
@@ -134,9 +150,10 @@ An anonymous pull is refused in two cases:
 - **The package is not public (yet).** A GHCR package has its own visibility,
   separate from the repository's: a newly published package starts private
   and stays so when the repository is made public. An owner of the
-  organization changes it once, on the package page under **Package settings
-  → Change visibility**. Until then — and in any fork that keeps its package
-  private — pull with a credential, as below.
+  organization makes it public once — see
+  [Making the package public](#making-the-package-public). Until then — and
+  in any fork that keeps its package private — pull with a credential, as
+  below.
 - **A stale credential is stored for `ghcr.io`.** An expired token in the
   Docker config is rejected even for a public image. Run
   `docker logout ghcr.io` and pull again.
@@ -159,6 +176,31 @@ If the pull is still `unauthorized` after logging in, your GitHub account
 lacks read access to the package itself (package permissions are managed
 separately from repository permissions, under the package's **Manage access**
 settings) — ask an owner of the package to grant it.
+
+### Making the package public
+
+Done once per package, by an owner of the organization, on `github.com`:
+
+1. Open the package page:
+   `https://github.com/orgs/B-AROL-O/packages/container/package/chatbotv2`.
+2. **Package settings → Danger Zone → Change visibility → Public**, then type
+   the package name to confirm. The change is not saved until it is
+   confirmed: the page header should now read **Public**.
+3. If **Public** is not offered, or the package reverts to private, the
+   organization does not allow public packages. An owner enables it under
+   **Organization settings → Packages → Package creation** (tick **Public**),
+   then repeats step 2. In an Enterprise with managed users, public packages
+   may not be allowed at all.
+
+Verify anonymously, as in [Cutting a release](#cutting-a-release)
+(`docker logout ghcr.io`, then `docker pull`). Without Docker, ask GHCR for an
+anonymous pull token — `200` with a `token` means public, `401
+authentication required` means still private:
+
+```bash
+curl -s -w ' HTTP %{http_code}\n' \
+  "https://ghcr.io/token?scope=repository:b-arol-o/chatbotv2:pull"
+```
 
 ---
 
@@ -186,6 +228,7 @@ explicit previous version tag instead of `:latest`.
 | `GET /health` reports `"version": "dev"` | The image was built without the `APP_VERSION` build arg — i.e. it is not a release-workflow build |
 | Tag push doesn't trigger the workflow | Tag doesn't match `chatbotv2/vMAJOR.MINOR.PATCH[-prerelease]` — check the regex in the workflow's "Validate tag & parse version" step |
 | Tag exists locally but there's no Release and no workflow run | The tag was never pushed — `git tag -l` shows local tags too. Check with `git ls-remote --tags origin`, then `git push origin <tag>` |
+| Anonymous `docker pull` → `unauthorized` right after the first release | The package was created private — see [Making the package public](#making-the-package-public) |
 | `docker pull` → `unauthorized` | No `docker login` done yet, or your PAT lacks `read:packages` — see [Pulling the image](#pulling-the-image) |
 | `docker pull` → `unauthorized` even after login | Your account lacks read access to the package — ask a repo admin to grant it via the package's "Manage Actions access" settings |
 | Push step fails in CI | GHCR (Packages) may not be enabled for the repo/org — see the archive fallback commented in the workflow (attach the image to the Release instead) |
