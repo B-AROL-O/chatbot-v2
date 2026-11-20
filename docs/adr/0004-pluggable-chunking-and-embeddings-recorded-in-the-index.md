@@ -54,7 +54,7 @@ We will make chunking and embedding pluggable behind two small interfaces:
 Built-in implementations, selected by configuration:
 
 | Kind | Implementation | Behaviour |
-|---|---|---|
+| --- | --- | --- |
 | Chunker | `fixed` | **Default**: today's 1000/200 windows |
 | Chunker | `recursive` | Splits at headings, then paragraphs, then sentences |
 | Chunker | `markdown` | One section per heading; tables kept whole; heading path prepended as context |

@@ -49,6 +49,9 @@ When `LLM_API=litellm`:
 
 - **Startup check.** The backend checks at startup that the provider's environment
   variables are set, and refuses to start, naming the missing variable.
+- **No OpenAI client.** `api/main.py` does not build the OpenAI client (or its
+  Langfuse wrapper), and `open_stream` gets `client=None`. Each request then has
+  one LLM client and one Langfuse integration, not two.
 - **Tracing.** Langfuse tracing goes through LiteLLM's Langfuse callback instead of
   the OpenAI wrapper.
 
