@@ -34,3 +34,5 @@ sign it deserves one.
 | [0001](0001-backend-owns-chat-logic-frontends-are-thin-clients.md) | Backend owns all chat/RAG logic; frontends are thin HTTP/SSE clients |
 | [0002](0002-read-only-sql-tool-with-two-defense-layers.md) | LLM SQL tool is read-only, enforced by two independent layers |
 | [0003](0003-access-filtering-via-business-key-metadata-at-query-time.md) | Document access is filtered at query time via business-key chunk metadata |
+| [0004](0004-pluggable-chunking-and-embeddings-recorded-in-the-index.md) | Chunking and embedding are pluggable; each index records the configuration it was built with |
+| [0005](0005-litellm-as-optional-llm-backend.md) | LiteLLM is an optional in-process LLM backend behind `llm_api.py`; the OpenAI client stays the default |
