@@ -92,8 +92,8 @@ class _TurnTimer:
             }
         )
 
-    def record_tool(self, name: str, started: float, ok: bool) -> None:
-        self.tools.append({"name": name, "ms": _ms(_now() - started), "ok": ok})
+    def record_tool(self, name: str, ms: int, ok: bool) -> None:
+        self.tools.append({"name": name, "ms": ms, "ok": ok})
 
     def usage(self, rounds: int, round_limit_hit: bool = False) -> dict:
         return {
@@ -225,6 +225,52 @@ def _extract_citations(tool_result_json: str) -> list[Citation]:
             )
         )
     return citations
+
+
+def _parse_tool_arguments(raw: str) -> tuple[dict | None, str | None]:
+    """``(arguments, None)``, or ``(None, error_result)`` when ``raw`` is not valid JSON.
+
+    A call with invalid arguments is never dispatched: the error result goes back to the model instead.
+    """
+    try:
+        return json.loads(raw or "{}"), None
+    except json.JSONDecodeError as exc:
+        return None, json.dumps({"error": f"Invalid arguments: {exc}"})
+
+
+def _run_tool(dispatch, name: str, args: dict, label: str) -> tuple[str, bool, int]:
+    """Dispatch one tool call. Returns ``(result, ok, ms)``.
+
+    Touches no state of the turn, so it can run off the loop's thread: the caller records
+    the outcome with ``_finish_tool``. ``label`` names the call in the failure log.
+    """
+    started = _now()
+    try:
+        result = dispatch(name, args)
+        ok = True
+    except Exception as exc:  # broad on purpose: never crash the chat loop
+        logger.exception("%s %s failed", label, name)
+        result = json.dumps({"error": f"Tool {name} failed: {exc}"})
+        ok = False
+    return result, ok, _ms(_now() - started)
+
+
+def _finish_tool(
+    call_id: str,
+    name: str,
+    result: str,
+    ok: bool,
+    ms: int,
+    messages: list[dict],
+    timer: _TurnTimer,
+    all_citations: list[Citation],
+) -> ToolResultEvent:
+    """Record one finished tool call in the turn: timing, citations, tool message. Returns its event."""
+    timer.record_tool(name, ms, ok)
+    citations = _extract_citations(result) if ok else []
+    all_citations.extend(citations)
+    messages.append({"role": "tool", "tool_call_id": call_id, "content": result})
+    return ToolResultEvent(name=name, ok=ok, citations=citations)
 
 
 _LENGTH_RETRY_PROMPT = (
@@ -425,19 +471,8 @@ def stream_chat(
             )
             yield ToolCallEvent(name=name, arguments=args)
             logger.info("Pre-search: %s(%s)", name, args)
-            tool_started = _now()
-            try:
-                result = domain.dispatch(name, args)
-                ok = True
-            except Exception as exc:  # broad on purpose: never crash the chat loop
-                logger.exception("Pre-search %s failed", name)
-                result = json.dumps({"error": f"Tool {name} failed: {exc}"})
-                ok = False
-            timer.record_tool(name, tool_started, ok)
-            citations = _extract_citations(result) if ok else []
-            all_citations.extend(citations)
-            messages.append({"role": "tool", "tool_call_id": call_id, "content": result})
-            yield ToolResultEvent(name=name, ok=ok, citations=citations)
+            result, ok, ms = _run_tool(domain.dispatch, name, args, "Pre-search")
+            yield _finish_tool(call_id, name, result, ok, ms, messages, timer, all_citations)
 
         for round_num in range(max_tool_rounds + 1):
             call_started = _now()
@@ -572,36 +607,16 @@ def stream_chat(
 
             # Dispatch each tool call and append its result.
             for tc in tool_calls_acc.values():
-                try:
-                    args = json.loads(tc["arguments"] or "{}")
-                except json.JSONDecodeError as exc:
+                args, invalid = _parse_tool_arguments(tc["arguments"])
+                if invalid is not None:
                     yield ToolCallEvent(name=tc["name"], arguments={})
-                    timer.record_tool(tc["name"], _now(), ok=False)
-                    result = json.dumps({"error": f"Invalid arguments: {exc}"})
-                    messages.append(
-                        {"role": "tool", "tool_call_id": tc["id"], "content": result}
-                    )
-                    yield ToolResultEvent(name=tc["name"], ok=False, citations=[])
+                    yield _finish_tool(tc["id"], tc["name"], invalid, False, 0, messages, timer, all_citations)
                     continue
 
                 yield ToolCallEvent(name=tc["name"], arguments=args)
                 logger.info("Tool call: %s(%s)", tc["name"], args)
-                tool_started = _now()
-                try:
-                    result = domain.dispatch(tc["name"], args)
-                    ok = True
-                except Exception as exc:  # broad on purpose: never crash the chat loop
-                    logger.exception("Tool %s failed", tc["name"])
-                    result = json.dumps({"error": f"Tool {tc['name']} failed: {exc}"})
-                    ok = False
-                timer.record_tool(tc["name"], tool_started, ok)
-
-                citations = _extract_citations(result) if ok else []
-                all_citations.extend(citations)
-                messages.append(
-                    {"role": "tool", "tool_call_id": tc["id"], "content": result}
-                )
-                yield ToolResultEvent(name=tc["name"], ok=ok, citations=citations)
+                result, ok, ms = _run_tool(domain.dispatch, tc["name"], args, "Tool")
+                yield _finish_tool(tc["id"], tc["name"], result, ok, ms, messages, timer, all_citations)
     except OutputFiltered as exc:
         # The answer stopped partway: the tokens already sent are not a
         # complete answer, so end on an error rather than a DoneEvent.
