@@ -24,10 +24,12 @@ Differences from the legacy version:
 
 from __future__ import annotations
 
+import contextvars
 import json
 import logging
 import time
 from collections.abc import Iterator
+from concurrent.futures import ThreadPoolExecutor
 
 from .content_filter import OutputFiltered, categories_in, describe_block, filtered_categories
 from .domains import DomainConfig
@@ -273,6 +275,57 @@ def _finish_tool(
     return ToolResultEvent(name=name, ok=ok, citations=citations)
 
 
+def _dispatch_round_concurrently(
+    calls: list[dict],
+    dispatch,
+    tool_concurrency: int,
+    messages: list[dict],
+    timer: _TurnTimer,
+    all_citations: list[Citation],
+) -> Iterator[ChatEvent]:
+    """Run one round's tool calls at the same time, up to ``tool_concurrency`` at once.
+
+    Every ``ToolCallEvent`` of the round comes first, then the ``ToolResultEvent``s in the
+    model's call order, each as soon as it and the calls before it are done. Results, tool
+    messages, citations and timings are all recorded here, on the loop's thread, in call
+    order, whatever order the calls finish in, so the conversation stays deterministic.
+
+    A call with invalid arguments is never dispatched. Each dispatched call runs in its own
+    copy of the caller's context: one ``Context`` cannot be entered by two threads at once.
+    With a single valid call there is nothing to overlap, and it runs inline.
+    """
+    parsed = [(tc, *_parse_tool_arguments(tc["arguments"])) for tc in calls]
+    for tc, args, invalid in parsed:
+        yield ToolCallEvent(name=tc["name"], arguments={} if invalid is not None else args)
+        if invalid is None:
+            logger.info("Tool call: %s(%s)", tc["name"], args)
+
+    valid = [i for i, (_, _, invalid) in enumerate(parsed) if invalid is None]
+    pool = None
+    if len(valid) > 1:
+        pool = ThreadPoolExecutor(max_workers=min(tool_concurrency, len(valid)), thread_name_prefix="tool")
+    try:
+        futures = {}
+        if pool is not None:
+            for i in valid:
+                tc, args, _ = parsed[i]
+                context = contextvars.copy_context()
+                futures[i] = pool.submit(context.run, _run_tool, dispatch, tc["name"], args, "Tool")
+        for i, (tc, args, invalid) in enumerate(parsed):
+            if invalid is not None:
+                result, ok, ms = invalid, False, 0
+            elif pool is None:
+                result, ok, ms = _run_tool(dispatch, tc["name"], args, "Tool")
+            else:
+                result, ok, ms = futures[i].result()
+            yield _finish_tool(tc["id"], tc["name"], result, ok, ms, messages, timer, all_citations)
+    finally:
+        # Normally every call is done by now. If the consumer closed the stream early, don't
+        # block on calls still running: they finish in the background and are discarded.
+        if pool is not None:
+            pool.shutdown(wait=False, cancel_futures=True)
+
+
 _LENGTH_RETRY_PROMPT = (
     "Your previous attempt used all of its output budget before giving an answer. "
     "Answer now, briefly, using only the information already gathered above; do "
@@ -416,7 +469,9 @@ def stream_chat(
     ``llm_api.py``. Either way the loop below sees chat-completions-shaped chunks.
 
     ``tool_concurrency``: how many tool calls of one round may run at the same time
-    (``CHAT_TOOL_CONCURRENCY``). Accepted but not used yet: the calls still run one after another.
+    (``CHAT_TOOL_CONCURRENCY``); see ``_dispatch_round_concurrently``. ``1`` keeps the
+    sequential loop exactly: each call's ``ToolCallEvent`` then its ``ToolResultEvent``, one
+    call after another. A round with a single call always takes that path.
     """
     logger.info(
         "stream_chat: domain=%s user=%s message=%r (history length: %d)",
@@ -605,8 +660,15 @@ def stream_chat(
                 assistant_msg["content"] = raw
             messages.append(assistant_msg)
 
-            # Dispatch each tool call and append its result.
-            for tc in tool_calls_acc.values():
+            calls = list(tool_calls_acc.values())
+            if tool_concurrency > 1 and len(calls) > 1:
+                yield from _dispatch_round_concurrently(
+                    calls, domain.dispatch, tool_concurrency, messages, timer, all_citations
+                )
+                continue
+
+            # Dispatch each tool call and append its result, one after another.
+            for tc in calls:
                 args, invalid = _parse_tool_arguments(tc["arguments"])
                 if invalid is not None:
                     yield ToolCallEvent(name=tc["name"], arguments={})

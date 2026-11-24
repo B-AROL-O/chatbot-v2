@@ -13,8 +13,12 @@ All fixtures/fakes live in this file per the WP8a file-ownership split (no
 
 from __future__ import annotations
 
+import contextvars
 import json
+import threading
 from types import SimpleNamespace
+
+import pytest
 
 from sme_chatbot.core.chat import stream_chat
 from sme_chatbot.core.domains import DomainConfig
@@ -365,7 +369,7 @@ def test_two_calls_in_one_round_run_in_order_with_interleaved_events():
 
     client = FakeStreamClient(_two_call_round())
 
-    events = run(client, dispatch=dispatch)
+    events = run(client, dispatch=dispatch, tool_concurrency=1)
 
     assert [(type(e).__name__, getattr(e, "name", None)) for e in events] == [
         ("ToolCallEvent", "search_a"),
@@ -382,6 +386,208 @@ def test_two_calls_in_one_round_run_in_order_with_interleaved_events():
     messages = client.calls[1]["messages"]
     assert [tc["id"] for tc in messages[-3]["tool_calls"]] == ["call_a", "call_b"]
     assert [(m["role"], m["tool_call_id"]) for m in messages[-2:]] == [("tool", "call_a"), ("tool", "call_b")]
+
+
+# ---------------------------------------------------------------------------
+# tool calls of one round run concurrently (issue #4)
+# ---------------------------------------------------------------------------
+
+
+def _event_names(events):
+    return [(type(e).__name__, getattr(e, "name", None)) for e in events]
+
+
+def _tool_messages(client):
+    return [(m["tool_call_id"], json.loads(m["content"])) for m in client.calls[1]["messages"] if m["role"] == "tool"]
+
+
+@pytest.mark.parametrize(("tool_concurrency", "overlap"), [(2, True), (1, False)])
+def test_two_slow_calls_overlap_only_when_concurrency_allows_it(tool_concurrency, overlap):
+    # Each call waits for the other at the barrier: it is passed only if both run at once.
+    # Sequential calls can never meet there, so they time out (quickly) and fail instead.
+    barrier = threading.Barrier(2, timeout=5 if overlap else 0.2)
+
+    def dispatch(name, args):
+        barrier.wait()
+        return _citing_dispatch(name, args)
+
+    client = FakeStreamClient(_two_call_round())
+
+    events = run(client, dispatch=dispatch, tool_concurrency=tool_concurrency)
+
+    assert [e.ok for e in events if isinstance(e, ToolResultEvent)] == [overlap, overlap]
+    assert isinstance(events[-1], DoneEvent)
+
+
+def test_concurrent_calls_send_every_call_first_then_results_in_call_order():
+    """The second call finishes first; events, messages, citations and timings keep call order."""
+    b_done = threading.Event()
+
+    def dispatch(name, args):
+        if name == "search_a":
+            assert b_done.wait(timeout=5), "search_b never finished: the calls did not overlap"
+        else:
+            b_done.set()
+        return _citing_dispatch(name, args)
+
+    client = FakeStreamClient(_two_call_round())
+
+    events = run(client, dispatch=dispatch, tool_concurrency=4)
+
+    assert _event_names(events) == [
+        ("ToolCallEvent", "search_a"),
+        ("ToolCallEvent", "search_b"),
+        ("ToolResultEvent", "search_a"),
+        ("ToolResultEvent", "search_b"),
+        ("TokenEvent", None),
+        ("DoneEvent", None),
+    ]
+    assert [e.arguments for e in events[:2]] == [{"q": "a"}, {"q": "b"}]
+    assert all(e.ok for e in events if isinstance(e, ToolResultEvent))
+    done = events[-1]
+    assert [c.source for c in done.citations] == ["search_a.pdf", "search_b.pdf"]
+    assert [t["name"] for t in done.usage["timings"]["tools"]] == ["search_a", "search_b"]
+    assert [call_id for call_id, _ in _tool_messages(client)] == ["call_a", "call_b"]
+
+
+def test_a_failing_concurrent_call_does_not_affect_the_other():
+    def dispatch(name, args):
+        if name == "search_a":
+            raise RuntimeError("chroma down")
+        return _citing_dispatch(name, args)
+
+    client = FakeStreamClient(_two_call_round())
+
+    events = run(client, dispatch=dispatch, tool_concurrency=4)
+
+    results = [e for e in events if isinstance(e, ToolResultEvent)]
+    assert [(r.name, r.ok) for r in results] == [("search_a", False), ("search_b", True)]
+    assert results[0].citations == []
+    assert [c.source for c in events[-1].citations] == ["search_b.pdf"]
+    (_, a_payload), (_, b_payload) = _tool_messages(client)
+    assert "chroma down" in a_payload["error"]
+    assert "results" in b_payload
+    assert [t["ok"] for t in events[-1].usage["timings"]["tools"]] == [False, True]
+
+
+def test_invalid_arguments_next_to_a_valid_call_are_rejected_without_dispatch():
+    ran = []
+
+    def dispatch(name, args):
+        ran.append((name, threading.current_thread()))
+        return _citing_dispatch(name, args)
+
+    client = FakeStreamClient(_two_call_round(second_arguments="{oops"))
+
+    events = run(client, dispatch=dispatch, tool_concurrency=4)
+
+    assert _event_names(events)[:4] == [
+        ("ToolCallEvent", "search_a"),
+        ("ToolCallEvent", "search_b"),
+        ("ToolResultEvent", "search_a"),
+        ("ToolResultEvent", "search_b"),
+    ]
+    assert events[1].arguments == {}
+    assert [e.ok for e in events if isinstance(e, ToolResultEvent)] == [True, False]
+    # Only one call left to run: nothing to overlap, so it runs inline.
+    assert ran == [("search_a", threading.current_thread())]
+    assert "Invalid arguments" in _tool_messages(client)[1][1]["error"]
+    assert events[-1].usage["timings"]["tools"][1] == {"name": "search_b", "ms": 0, "ok": False}
+
+
+def test_a_single_call_runs_inline_on_the_loop_thread():
+    threads = []
+
+    def dispatch(name, args):
+        threads.append(threading.current_thread())
+        return "{}"
+
+    run(FakeStreamClient(_tool_round_then_answer()), dispatch=dispatch, tool_concurrency=4)
+
+    assert threads == [threading.current_thread()]
+
+
+@pytest.mark.parametrize(("tool_concurrency", "expected_peak"), [(2, 2), (3, 3)])
+def test_no_more_calls_run_at_once_than_tool_concurrency(tool_concurrency, expected_peak):
+    # Every call stays busy until all three are running at once, or a short timeout passes.
+    # So the peak reached is exactly the number of calls the pool lets run together.
+    all_running = threading.Condition()
+    active = 0
+    peak = 0
+
+    def dispatch(name, args):
+        nonlocal active, peak
+        with all_running:
+            active += 1
+            peak = max(peak, active)
+            all_running.notify_all()
+            all_running.wait_for(lambda: active >= 3, timeout=0.3)
+            active -= 1
+        return "{}"
+
+    client = FakeStreamClient(
+        [
+            [
+                make_chunk(tool_calls=[make_tool_call_delta(i, id_=f"call_{n}", name=f"search_{n}", arguments="{}")])
+                for i, n in enumerate("abc")
+            ]
+            + [make_chunk(finish_reason="tool_calls")],
+            [make_chunk(content="ok"), make_chunk(finish_reason="stop")],
+        ]
+    )
+
+    events = run(client, dispatch=dispatch, tool_concurrency=tool_concurrency)
+
+    assert peak == expected_peak
+    assert [e.ok for e in events if isinstance(e, ToolResultEvent)] == [True, True, True]
+
+
+def test_closing_the_stream_mid_round_does_not_wait_for_a_running_call():
+    """A client that disconnects must not hold its request thread until a slow tool returns."""
+    release = threading.Event()
+    b_finished = threading.Event()
+
+    def dispatch(name, args):
+        if name == "search_b":
+            release.wait(timeout=5)
+            b_finished.set()
+        return "{}"
+
+    domain = make_domain(dispatch=dispatch)
+    stream = stream_chat(
+        FakeStreamClient(_two_call_round()), model="m", domain=domain, message="hi", history=[],
+        identity=RequestIdentity(user_id="u1"), tool_concurrency=4,
+    )
+    first_result = next(e for e in stream if isinstance(e, ToolResultEvent))
+    assert first_result.name == "search_a"
+
+    stream.close()  # search_b is still blocked in its worker thread
+
+    closed_before_b_finished = not b_finished.is_set()
+    release.set()
+    assert closed_before_b_finished
+
+
+_request_tag: contextvars.ContextVar[str] = contextvars.ContextVar("request_tag", default="unset")
+
+
+def test_concurrent_calls_see_the_callers_context_variables():
+    seen = []
+    main_thread = threading.current_thread()
+
+    def dispatch(name, args):
+        seen.append((name, _request_tag.get(), threading.current_thread() is main_thread))
+        _request_tag.set(f"changed by {name}")  # must not leak into the caller or the other call
+        return "{}"
+
+    token = _request_tag.set("req-42")
+    try:
+        run(FakeStreamClient(_two_call_round()), dispatch=dispatch, tool_concurrency=4)
+        assert _request_tag.get() == "req-42"
+    finally:
+        _request_tag.reset(token)
+
+    assert sorted(seen) == [("search_a", "req-42", False), ("search_b", "req-42", False)]
 
 
 # ---------------------------------------------------------------------------
