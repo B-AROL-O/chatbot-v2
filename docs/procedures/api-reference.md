@@ -51,11 +51,25 @@ etc.) are never included.
 {
   "version": "0.5.2",
   "model": "gpt-6-luna",
+  "llm_api": "chat_completions",
   "llm_base_url": "https://...",
+  "temperature": null,
+  "seed": null,
+  "max_tokens": null,
+  "reasoning_effort": null,
+  "retry_reasoning_effort": null,
+  "pre_search": false,
+  "pre_search_results": null,
+  "tool_concurrency": 4,
   "auth_mode": "dev",
   "domains": ["documents", "sample_cdo", "sample_manuals"]
 }
 ```
+
+Each field reflects one backend setting from `.env.example` (`LLM_*`,
+`CHAT_PRE_SEARCH*`, `CHAT_TOOL_CONCURRENCY`, `AUTH_MODE`); `null` means unset,
+so the LLM server's own default applies. `sme-chatbot-eval` records this
+response with every run, so two runs can be told apart by their settings.
 
 ## `POST /chat/message`
 
@@ -93,6 +107,29 @@ Response is `text/event-stream` (via `sse-starlette`). Client renders
 | `tool_result` | `{"name": "...", "ok": true, "citations": [Citation, ...]}` | Full tool payload is deliberately not streamed — only success + citations |
 | `done` | `{"content": "<full answer>", "citations": [Citation, ...], "usage": Usage}` | Terminal on success |
 | `error` | `{"message": "..."}` | Terminal, sent instead of `done` |
+
+#### Order of `tool_call` and `tool_result` events
+
+When the model asks for several tools in one round, the backend runs them
+concurrently, up to `CHAT_TOOL_CONCURRENCY` (default `4`) at a time. The round
+then sends every `tool_call` event first, followed by the `tool_result` events
+in the same order as the calls, whatever order the calls finish in:
+
+```text
+tool_call A, tool_call B, tool_result A, tool_result B
+```
+
+With `CHAT_TOOL_CONCURRENCY=1`, and for any round with a single call, each
+`tool_call` is followed directly by its `tool_result`:
+
+```text
+tool_call A, tool_result A, tool_call B, tool_result B
+```
+
+So don't assume a `tool_result` comes right after its `tool_call`. In both
+modes, each `tool_result` belongs to the oldest `tool_call` that has no result
+yet (first in, first out), and their `name` fields agree. `done.citations`
+lists citations in call order either way.
 
 ### `stream: false` — single JSON response
 
