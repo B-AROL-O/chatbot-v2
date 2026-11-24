@@ -408,7 +408,7 @@ def _fake_turn_with_timings(client, model, domain, message, history, identity, m
         citations=[],
         usage={
             "rounds": 2,
-            "timings": {"total_ms": 900, "ttft_ms": 800, "llm_ms": 650, "tool_ms": 250},
+            "timings": {"total_ms": 900, "ttft_ms": 800, "llm_ms": 650, "tool_ms": 250, "tool_wall_ms": 180},
         },
     )
 
@@ -469,6 +469,7 @@ def test_request_log_carries_durations_but_not_the_message(app_client, set_strea
     assert "ttft_ms=800" in line
     assert "llm_ms=650" in line
     assert "tool_ms=250" in line
+    assert "tool_wall_ms=180" in line
     assert "setup_ms=" in line
     assert "SEGRETO-DEL-CLIENTE" not in line
 

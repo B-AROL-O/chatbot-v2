@@ -1137,6 +1137,68 @@ def test_timings_record_a_tool_with_broken_arguments_as_not_ok():
     assert done.usage["timings"]["tools"] == [{"name": "t", "ms": 0, "ok": False}]
 
 
+def _timed_dispatch(clock, ms_by_name):
+    def dispatch(name, args):
+        clock.advance_ms(ms_by_name[name])
+        return "{}"
+
+    return dispatch
+
+
+def test_sequential_calls_have_equal_tool_and_wall_time(monkeypatch):
+    clock = FakeClock()
+    monkeypatch.setattr("sme_chatbot.core.chat._now", clock)
+    client = FakeStreamClient(_two_call_round())
+
+    done = run(client, dispatch=_timed_dispatch(clock, {"search_a": 100, "search_b": 150}), tool_concurrency=1)[-1]
+
+    timings = done.usage["timings"]
+    assert timings["tools"] == [
+        {"name": "search_a", "ms": 100, "ok": True},
+        {"name": "search_b", "ms": 150, "ok": True},
+    ]
+    assert (timings["tool_ms"], timings["tool_wall_ms"]) == (250, 250)
+
+
+def test_overlapping_calls_count_once_in_wall_time_but_fully_in_tool_time(monkeypatch):
+    clock = FakeClock()
+    monkeypatch.setattr("sme_chatbot.core.chat._now", clock)
+    both_started = threading.Barrier(2, timeout=5)
+    advanced = threading.Event()
+
+    def dispatch(name, args):
+        both_started.wait()  # both calls have read their start time
+        if name == "search_a":
+            clock.advance_ms(300)
+            advanced.set()
+        else:
+            assert advanced.wait(timeout=5)
+        return "{}"
+
+    done = run(FakeStreamClient(_two_call_round()), dispatch=dispatch, tool_concurrency=4)[-1]
+
+    timings = done.usage["timings"]
+    assert [t["ms"] for t in timings["tools"]] == [300, 300]
+    assert (timings["tool_ms"], timings["tool_wall_ms"]) == (600, 300)
+
+
+def test_wall_time_adds_up_the_pre_search_and_every_round(monkeypatch):
+    clock = FakeClock()
+    monkeypatch.setattr("sme_chatbot.core.chat._now", clock)
+    domain = _pre_search_domain(_timed_dispatch(clock, {"search_documents": 100, "t": 40}))
+    client = FakeStreamClient(_tool_round_then_answer())
+
+    done = _run_domain(client, domain, pre_search=True)[-1]
+
+    assert (done.usage["timings"]["tool_ms"], done.usage["timings"]["tool_wall_ms"]) == (140, 140)
+
+
+def test_wall_time_is_zero_without_tool_calls():
+    done = run(FakeStreamClient([[make_chunk(content="ok", finish_reason="stop")]]))[-1]
+
+    assert done.usage["timings"]["tool_wall_ms"] == 0
+
+
 # ---------------------------------------------------------------------------
 # sampling settings: sent only when configured
 # ---------------------------------------------------------------------------

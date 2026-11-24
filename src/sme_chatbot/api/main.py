@@ -189,7 +189,7 @@ def _log_request(domain_key: str, identity: RequestIdentity, message: str, usage
     timings = usage.get("timings") or {}
     logger.info(
         "chat/message domain=%s user_id=%s message_len=%d rounds=%s round_limit_hit=%s "
-        "setup_ms=%s total_ms=%s ttft_ms=%s llm_ms=%s tool_ms=%s",
+        "setup_ms=%s total_ms=%s ttft_ms=%s llm_ms=%s tool_ms=%s tool_wall_ms=%s",
         domain_key,
         identity.user_id,
         len(message),
@@ -200,6 +200,7 @@ def _log_request(domain_key: str, identity: RequestIdentity, message: str, usage
         timings.get("ttft_ms"),
         timings.get("llm_ms"),
         timings.get("tool_ms"),
+        timings.get("tool_wall_ms"),
     )
 
 

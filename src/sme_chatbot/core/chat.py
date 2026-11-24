@@ -77,6 +77,7 @@ class _TurnTimer:
         self.ttft_ms: int | None = None
         self.llm_calls: list[dict] = []
         self.tools: list[dict] = []
+        self.tool_wall_ms = 0
 
     def mark_visible(self) -> None:
         if self.ttft_ms is None:
@@ -97,6 +98,10 @@ class _TurnTimer:
     def record_tool(self, name: str, ms: int, ok: bool) -> None:
         self.tools.append({"name": name, "ms": ms, "ok": ok})
 
+    def record_tool_phase(self, started: float) -> None:
+        """Add the elapsed time of one tool phase (a round's calls, or the pre-search)."""
+        self.tool_wall_ms += _ms(_now() - started)
+
     def usage(self, rounds: int, round_limit_hit: bool = False) -> dict:
         return {
             "rounds": rounds,
@@ -107,7 +112,10 @@ class _TurnTimer:
                 "total_ms": _ms(_now() - self._start),
                 "ttft_ms": self.ttft_ms,
                 "llm_ms": sum(c["total_ms"] for c in self.llm_calls),
+                # Sum of the calls' own times: comparable with runs made before calls overlapped.
                 "tool_ms": sum(t["ms"] for t in self.tools),
+                # Time actually spent waiting for tools; below tool_ms when calls overlapped.
+                "tool_wall_ms": self.tool_wall_ms,
                 "llm_calls": self.llm_calls,
                 "tools": self.tools,
             },
@@ -273,6 +281,27 @@ def _finish_tool(
     all_citations.extend(citations)
     messages.append({"role": "tool", "tool_call_id": call_id, "content": result})
     return ToolResultEvent(name=name, ok=ok, citations=citations)
+
+
+def _dispatch_round_sequentially(
+    calls: list[dict],
+    dispatch,
+    messages: list[dict],
+    timer: _TurnTimer,
+    all_citations: list[Citation],
+) -> Iterator[ChatEvent]:
+    """Run one round's tool calls one after another: each ``ToolCallEvent``, then its result."""
+    for tc in calls:
+        args, invalid = _parse_tool_arguments(tc["arguments"])
+        if invalid is not None:
+            yield ToolCallEvent(name=tc["name"], arguments={})
+            yield _finish_tool(tc["id"], tc["name"], invalid, False, 0, messages, timer, all_citations)
+            continue
+
+        yield ToolCallEvent(name=tc["name"], arguments=args)
+        logger.info("Tool call: %s(%s)", tc["name"], args)
+        result, ok, ms = _run_tool(dispatch, tc["name"], args, "Tool")
+        yield _finish_tool(tc["id"], tc["name"], result, ok, ms, messages, timer, all_citations)
 
 
 def _dispatch_round_concurrently(
@@ -526,8 +555,10 @@ def stream_chat(
             )
             yield ToolCallEvent(name=name, arguments=args)
             logger.info("Pre-search: %s(%s)", name, args)
+            phase_started = _now()
             result, ok, ms = _run_tool(domain.dispatch, name, args, "Pre-search")
             yield _finish_tool(call_id, name, result, ok, ms, messages, timer, all_citations)
+            timer.record_tool_phase(phase_started)
 
         for round_num in range(max_tool_rounds + 1):
             call_started = _now()
@@ -661,24 +692,14 @@ def stream_chat(
             messages.append(assistant_msg)
 
             calls = list(tool_calls_acc.values())
+            phase_started = _now()
             if tool_concurrency > 1 and len(calls) > 1:
                 yield from _dispatch_round_concurrently(
                     calls, domain.dispatch, tool_concurrency, messages, timer, all_citations
                 )
-                continue
-
-            # Dispatch each tool call and append its result, one after another.
-            for tc in calls:
-                args, invalid = _parse_tool_arguments(tc["arguments"])
-                if invalid is not None:
-                    yield ToolCallEvent(name=tc["name"], arguments={})
-                    yield _finish_tool(tc["id"], tc["name"], invalid, False, 0, messages, timer, all_citations)
-                    continue
-
-                yield ToolCallEvent(name=tc["name"], arguments=args)
-                logger.info("Tool call: %s(%s)", tc["name"], args)
-                result, ok, ms = _run_tool(domain.dispatch, tc["name"], args, "Tool")
-                yield _finish_tool(tc["id"], tc["name"], result, ok, ms, messages, timer, all_citations)
+            else:
+                yield from _dispatch_round_sequentially(calls, domain.dispatch, messages, timer, all_citations)
+            timer.record_tool_phase(phase_started)
     except OutputFiltered as exc:
         # The answer stopped partway: the tokens already sent are not a
         # complete answer, so end on an error rather than a DoneEvent.

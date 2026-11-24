@@ -118,6 +118,7 @@ instead of an `error` event.
     "ttft_ms": 800,
     "llm_ms": 650,
     "tool_ms": 250,
+    "tool_wall_ms": 250,
     "llm_calls": [
       {"round": 0, "first_chunk_ms": 100, "total_ms": 150, "finish": "tool_calls"},
       {"round": 1, "first_chunk_ms": 400, "total_ms": 500, "finish": "stop"}
@@ -141,6 +142,11 @@ instead of an `error` event.
   (`<think>`-stripped) token, and is `null` if none was emitted.
   `first_chunk_ms` of each LLM call is the first chunk of any kind, so a long
   silent thinking phase shows up there.
+- `tool_ms` is the sum of the tool calls' own times (`tools[].ms`).
+  `tool_wall_ms` is the time the turn actually spent waiting for tools: the
+  pre-search plus each round's calls. When a round's calls run concurrently
+  (`CHAT_TOOL_CONCURRENCY` > 1) it is below `tool_ms`; one call per round, or
+  sequential calls, give about the same value for both.
 - `finish` is `tool_calls`, `stop`, or `forced_final` (the tools-less call made
   after hitting the round cap).
 - Token counts and cost are not part of `usage` yet.
