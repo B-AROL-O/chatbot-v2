@@ -42,6 +42,16 @@ def _get_optional(name: str, cast):
         raise ValueError(f"{name}={raw!r} is not a valid {cast.__name__}") from exc
 
 
+def _get_positive_int(name: str, default: int) -> int:
+    """An integer >= 1; unset or blank -> ``default``, junk or < 1 -> a startup error."""
+    value = _get_optional(name, int)
+    if value is None:
+        return default
+    if value < 1:
+        raise ValueError(f"{name}={value!r} must be at least 1")
+    return value
+
+
 def _get_choice(name: str, choices: tuple[str, ...]) -> str:
     """One of ``choices`` (case-insensitive); unset or blank -> the first, junk -> a startup error."""
     raw = os.environ.get(name, "").strip().lower() or choices[0]
@@ -89,6 +99,10 @@ CHAT_PRE_SEARCH = _get_bool("CHAT_PRE_SEARCH", "false")
 # Results the pre-search returns. Unset = the search tool's own default (8). Fewer results make
 # the first LLM call's prompt shorter (it spends seconds reading them) at some cost in recall.
 CHAT_PRE_SEARCH_RESULTS = _get_optional("CHAT_PRE_SEARCH_RESULTS", int)
+# Tool calls of one LLM round that run at the same time (issue #4). A round then takes as long
+# as its slowest call instead of the sum of all of them. 1 runs them one after another, exactly
+# as before this setting existed: the rollback switch.
+CHAT_TOOL_CONCURRENCY = _get_positive_int("CHAT_TOOL_CONCURRENCY", 4)
 
 # --- Auth ----------------------------------------------------------------
 

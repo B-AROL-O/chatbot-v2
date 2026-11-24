@@ -582,6 +582,19 @@ def test_pre_search_reaches_stream_chat_and_config_only_when_enabled(app_client,
     assert app_client.get("/config").json()["pre_search"] is True
 
 
+def test_tool_concurrency_reaches_stream_chat_only_when_not_the_default(app_client, set_stream_chat, monkeypatch):
+    seen: dict = {}
+    set_stream_chat(_capture_sampling(seen))
+    app_client.post("/chat/message", json={"domain": "sample_manuals", "message": "hi", "stream": False})
+    assert "tool_concurrency" not in seen["sampling"]
+    assert app_client.get("/config").json()["tool_concurrency"] == 4
+
+    monkeypatch.setattr(config, "CHAT_TOOL_CONCURRENCY", 1)
+    app_client.post("/chat/message", json={"domain": "sample_manuals", "message": "hi", "stream": False})
+    assert seen["sampling"] == {"tool_concurrency": 1}
+    assert app_client.get("/config").json()["tool_concurrency"] == 1
+
+
 def test_pre_search_results_sets_n_results_on_the_pre_search_only(app_client, set_stream_chat, monkeypatch):
     # Fewer pre-search results shorten the first LLM call's prompt
     from dataclasses import replace

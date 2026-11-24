@@ -39,6 +39,7 @@ def _clean_config(monkeypatch):
     monkeypatch.setattr(config, "LLM_REASONING_EFFORT", None, raising=False)
     monkeypatch.setattr(config, "LLM_RETRY_REASONING_EFFORT", None, raising=False)
     monkeypatch.setattr(config, "LLM_API", "chat_completions", raising=False)
+    monkeypatch.setattr(config, "CHAT_TOOL_CONCURRENCY", 4, raising=False)
     monkeypatch.setattr(config, "JWT_TENANT_ID", "test-tenant-id", raising=False)
     monkeypatch.setattr(config, "JWT_AUDIENCE", "test-audience", raising=False)
     monkeypatch.setattr(config, "LANGFUSE_ENABLED", False, raising=False)

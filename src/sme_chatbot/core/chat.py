@@ -52,6 +52,10 @@ _THINK_CLOSE = "</think>"
 # drive it deterministically instead of sleeping.
 _now = time.perf_counter
 
+# ``stream_chat``'s own default for ``tool_concurrency``. The API layer passes the
+# configured value only when it differs from this, like the other optional settings.
+DEFAULT_TOOL_CONCURRENCY = 4
+
 
 def _ms(seconds: float) -> int:
     return int(seconds * 1000)
@@ -347,6 +351,7 @@ def stream_chat(
     retry_reasoning_effort: str | None = None,
     pre_search: bool = False,
     llm_api: str = CHAT_COMPLETIONS,
+    tool_concurrency: int = DEFAULT_TOOL_CONCURRENCY,
 ) -> Iterator[ChatEvent]:
     """Run one user turn against ``domain`` and yield ``ChatEvent``s.
 
@@ -363,6 +368,9 @@ def stream_chat(
 
     ``llm_api``: ``"chat_completions"`` (the default) or ``"responses"``; see
     ``llm_api.py``. Either way the loop below sees chat-completions-shaped chunks.
+
+    ``tool_concurrency``: how many tool calls of one round may run at the same time
+    (``CHAT_TOOL_CONCURRENCY``). Accepted but not used yet: the calls still run one after another.
     """
     logger.info(
         "stream_chat: domain=%s user=%s message=%r (history length: %d)",
