@@ -339,6 +339,51 @@ def test_broken_json_tool_arguments_survives_and_continues():
     assert "error" in error_payload
 
 
+def _two_call_round(second_arguments='{"q": "b"}'):
+    """One LLM round asking for two tool calls, then an answer round."""
+    return [
+        [
+            make_chunk(tool_calls=[make_tool_call_delta(0, id_="call_a", name="search_a", arguments='{"q": "a"}')]),
+            make_chunk(tool_calls=[make_tool_call_delta(1, id_="call_b", name="search_b", arguments=second_arguments)]),
+            make_chunk(finish_reason="tool_calls"),
+        ],
+        [make_chunk(content="Done."), make_chunk(finish_reason="stop")],
+    ]
+
+
+def _citing_dispatch(name, args):
+    return json.dumps({"results": [{"source": f"{name}.pdf", "page": 1}]})
+
+
+def test_two_calls_in_one_round_run_in_order_with_interleaved_events():
+    """Pins the sequential behaviour that ``tool_concurrency=1`` must keep exactly."""
+    ran = []
+
+    def dispatch(name, args):
+        ran.append((name, args))
+        return _citing_dispatch(name, args)
+
+    client = FakeStreamClient(_two_call_round())
+
+    events = run(client, dispatch=dispatch)
+
+    assert [(type(e).__name__, getattr(e, "name", None)) for e in events] == [
+        ("ToolCallEvent", "search_a"),
+        ("ToolResultEvent", "search_a"),
+        ("ToolCallEvent", "search_b"),
+        ("ToolResultEvent", "search_b"),
+        ("TokenEvent", None),
+        ("DoneEvent", None),
+    ]
+    assert ran == [("search_a", {"q": "a"}), ("search_b", {"q": "b"})]
+    done = events[-1]
+    assert [c.source for c in done.citations] == ["search_a.pdf", "search_b.pdf"]
+    assert [t["name"] for t in done.usage["timings"]["tools"]] == ["search_a", "search_b"]
+    messages = client.calls[1]["messages"]
+    assert [tc["id"] for tc in messages[-3]["tool_calls"]] == ["call_a", "call_b"]
+    assert [(m["role"], m["tool_call_id"]) for m in messages[-2:]] == [("tool", "call_a"), ("tool", "call_b")]
+
+
 # ---------------------------------------------------------------------------
 # (d) <think> block split across multiple deltas -> no fragment leaks
 # ---------------------------------------------------------------------------
