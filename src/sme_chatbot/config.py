@@ -102,7 +102,9 @@ CHAT_PRE_SEARCH_RESULTS = _get_optional("CHAT_PRE_SEARCH_RESULTS", int)
 # Tool calls of one LLM round that run at the same time (issue #4). A round then takes as long
 # as its slowest call instead of the sum of all of them. 1 runs them one after another, exactly
 # as before this setting existed: the rollback switch.
-CHAT_TOOL_CONCURRENCY = _get_positive_int("CHAT_TOOL_CONCURRENCY", 4)
+# DEFAULT_TOOL_CONCURRENCY is also stream_chat's own default.
+DEFAULT_TOOL_CONCURRENCY = 4
+CHAT_TOOL_CONCURRENCY = _get_positive_int("CHAT_TOOL_CONCURRENCY", DEFAULT_TOOL_CONCURRENCY)
 
 # --- Auth ----------------------------------------------------------------
 

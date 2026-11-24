@@ -405,7 +405,7 @@ def _tool_messages(client):
 def test_two_slow_calls_overlap_only_when_concurrency_allows_it(tool_concurrency, overlap):
     # Each call waits for the other at the barrier: it is passed only if both run at once.
     # Sequential calls can never meet there, so they time out (quickly) and fail instead.
-    barrier = threading.Barrier(2, timeout=5 if overlap else 0.2)
+    barrier = threading.Barrier(2, timeout=5 if overlap else 0.05)
 
     def dispatch(name, args):
         barrier.wait()

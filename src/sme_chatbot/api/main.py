@@ -24,7 +24,7 @@ from sme_chatbot.api.auth import get_identity
 from sme_chatbot.api.schemas import ChatRequest, ChatResponse
 from sme_chatbot.api.schemas import Citation as CitationSchema
 from sme_chatbot.api.streaming import error_sse, event_to_sse
-from sme_chatbot.core.chat import DEFAULT_TOOL_CONCURRENCY, stream_chat
+from sme_chatbot.core.chat import stream_chat
 from sme_chatbot.core.domains import DOMAINS, documents_domain_for
 from sme_chatbot.core.events import DoneEvent, ErrorEvent, RequestIdentity
 from sme_chatbot.tools.warmup import warm_up
@@ -152,7 +152,7 @@ def create_app() -> FastAPI:
                 ("llm_api", None if config.LLM_API == "chat_completions" else config.LLM_API),
                 (
                     "tool_concurrency",
-                    None if config.CHAT_TOOL_CONCURRENCY == DEFAULT_TOOL_CONCURRENCY else config.CHAT_TOOL_CONCURRENCY,
+                    None if config.CHAT_TOOL_CONCURRENCY == config.DEFAULT_TOOL_CONCURRENCY else config.CHAT_TOOL_CONCURRENCY,
                 ),
             )
             if value is not None

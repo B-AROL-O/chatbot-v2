@@ -28,8 +28,11 @@ import contextvars
 import json
 import logging
 import time
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from concurrent.futures import ThreadPoolExecutor
+from functools import partial
+
+from sme_chatbot.config import DEFAULT_TOOL_CONCURRENCY
 
 from .content_filter import OutputFiltered, categories_in, describe_block, filtered_categories
 from .domains import DomainConfig
@@ -53,10 +56,6 @@ _THINK_CLOSE = "</think>"
 # Monotonic clock for the per-turn timings; a module attribute so tests can
 # drive it deterministically instead of sleeping.
 _now = time.perf_counter
-
-# ``stream_chat``'s own default for ``tool_concurrency``. The API layer passes the
-# configured value only when it differs from this, like the other optional settings.
-DEFAULT_TOOL_CONCURRENCY = 4
 
 
 def _ms(seconds: float) -> int:
@@ -283,34 +282,28 @@ def _finish_tool(
     return ToolResultEvent(name=name, ok=ok, citations=citations)
 
 
-def _dispatch_round_sequentially(
-    calls: list[dict],
-    dispatch,
-    messages: list[dict],
-    timer: _TurnTimer,
-    all_citations: list[Citation],
-) -> Iterator[ChatEvent]:
+# ``_finish_tool`` with the turn's ``messages``, ``timer`` and ``all_citations`` bound:
+# ``finish_tool(call_id, name, result, ok, ms) -> ToolResultEvent``.
+_FinishTool = Callable[[str, str, str, bool, int], ToolResultEvent]
+
+
+def _dispatch_round_sequentially(calls: list[dict], dispatch, finish_tool: _FinishTool) -> Iterator[ChatEvent]:
     """Run one round's tool calls one after another: each ``ToolCallEvent``, then its result."""
     for tc in calls:
         args, invalid = _parse_tool_arguments(tc["arguments"])
         if invalid is not None:
             yield ToolCallEvent(name=tc["name"], arguments={})
-            yield _finish_tool(tc["id"], tc["name"], invalid, False, 0, messages, timer, all_citations)
+            yield finish_tool(tc["id"], tc["name"], invalid, False, 0)
             continue
 
         yield ToolCallEvent(name=tc["name"], arguments=args)
         logger.info("Tool call: %s(%s)", tc["name"], args)
         result, ok, ms = _run_tool(dispatch, tc["name"], args, "Tool")
-        yield _finish_tool(tc["id"], tc["name"], result, ok, ms, messages, timer, all_citations)
+        yield finish_tool(tc["id"], tc["name"], result, ok, ms)
 
 
 def _dispatch_round_concurrently(
-    calls: list[dict],
-    dispatch,
-    tool_concurrency: int,
-    messages: list[dict],
-    timer: _TurnTimer,
-    all_citations: list[Citation],
+    calls: list[dict], dispatch, tool_concurrency: int, finish_tool: _FinishTool
 ) -> Iterator[ChatEvent]:
     """Run one round's tool calls at the same time, up to ``tool_concurrency`` at once.
 
@@ -347,7 +340,7 @@ def _dispatch_round_concurrently(
                 result, ok, ms = _run_tool(dispatch, tc["name"], args, "Tool")
             else:
                 result, ok, ms = futures[i].result()
-            yield _finish_tool(tc["id"], tc["name"], result, ok, ms, messages, timer, all_citations)
+            yield finish_tool(tc["id"], tc["name"], result, ok, ms)
     finally:
         # Normally every call is done by now. If the consumer closed the stream early, don't
         # block on calls still running: they finish in the background and are discarded.
@@ -530,6 +523,7 @@ def stream_chat(
 
     all_citations: list[Citation] = []
     timer = _TurnTimer()
+    finish_tool = partial(_finish_tool, messages=messages, timer=timer, all_citations=all_citations)
     # Accumulated visible text for the *whole turn*, not just the last round.
     # A `TokenEvent` is emitted for every visible delta of every round, so a
     # client that concatenates tokens holds exactly this string; `DoneEvent.
@@ -557,7 +551,7 @@ def stream_chat(
             logger.info("Pre-search: %s(%s)", name, args)
             phase_started = _now()
             result, ok, ms = _run_tool(domain.dispatch, name, args, "Pre-search")
-            yield _finish_tool(call_id, name, result, ok, ms, messages, timer, all_citations)
+            yield finish_tool(call_id, name, result, ok, ms)
             timer.record_tool_phase(phase_started)
 
         for round_num in range(max_tool_rounds + 1):
@@ -694,11 +688,9 @@ def stream_chat(
             calls = list(tool_calls_acc.values())
             phase_started = _now()
             if tool_concurrency > 1 and len(calls) > 1:
-                yield from _dispatch_round_concurrently(
-                    calls, domain.dispatch, tool_concurrency, messages, timer, all_citations
-                )
+                yield from _dispatch_round_concurrently(calls, domain.dispatch, tool_concurrency, finish_tool)
             else:
-                yield from _dispatch_round_sequentially(calls, domain.dispatch, messages, timer, all_citations)
+                yield from _dispatch_round_sequentially(calls, domain.dispatch, finish_tool)
             timer.record_tool_phase(phase_started)
     except OutputFiltered as exc:
         # The answer stopped partway: the tokens already sent are not a
