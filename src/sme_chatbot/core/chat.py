@@ -98,9 +98,13 @@ class _TurnTimer:
     def record_tool(self, name: str, ms: int, ok: bool) -> None:
         self.tools.append({"name": name, "ms": ms, "ok": ok})
 
-    def record_tool_phase(self, started: float) -> None:
-        """Add the elapsed time of one tool phase (a round's calls, or the pre-search)."""
-        self.tool_wall_ms += _ms(_now() - started)
+    def record_tool_phase(self, wall_ms: int) -> None:
+        """Add the wall time of one tool phase (a round's calls, or the pre-search).
+
+        Measured from the calls' own start and end times, so the time the loop spends
+        paused at a ``yield`` while the client reads an event is not counted.
+        """
+        self.tool_wall_ms += wall_ms
 
     def usage(self, rounds: int, round_limit_hit: bool = False) -> dict:
         return {
@@ -289,7 +293,11 @@ _FinishTool = Callable[[str, str, str, bool, int], ToolResultEvent]
 
 
 def _dispatch_round_sequentially(calls: list[dict], dispatch, finish_tool: _FinishTool) -> Iterator[ChatEvent]:
-    """Run one round's tool calls one after another: each ``ToolCallEvent``, then its result."""
+    """Run one round's tool calls one after another: each ``ToolCallEvent``, then its result.
+
+    Returns the round's wall time in ms: the sum of the calls' own times.
+    """
+    wall_ms = 0
     for tc in calls:
         args, invalid = _parse_tool_arguments(tc["arguments"])
         if invalid is not None:
@@ -300,7 +308,9 @@ def _dispatch_round_sequentially(calls: list[dict], dispatch, finish_tool: _Fini
         yield ToolCallEvent(name=tc["name"], arguments=args)
         logger.info("Tool call: %s(%s)", tc["name"], args)
         result, ok, ms = _run_tool(dispatch, tc["name"], args, "Tool")
+        wall_ms += ms
         yield finish_tool(tc["id"], tc["name"], result, ok, ms)
+    return wall_ms
 
 
 # The calls of every concurrent round, of every request, run on this one pool, so the
@@ -315,7 +325,7 @@ def _run_lane(queue: deque, dispatch) -> None:
     """Run calls from ``queue`` one at a time until it is empty; one lane per concurrent slot.
 
     Each job is ``(name, args, context, future)``: the call runs in ``context`` and its
-    ``(result, ok, ms)`` goes to ``future``. Pulling from a shared queue refills a
+    ``(result, ok, ms, ended)`` goes to ``future``. Pulling from a shared queue refills a
     slot as soon as any call of the round ends, without waiting for the loop's thread.
     ``popleft`` is atomic, so lanes need no lock to share the queue.
     """
@@ -329,7 +339,7 @@ def _run_lane(queue: deque, dispatch) -> None:
         except BaseException as exc:  # _run_tool catches Exception; never leave the loop waiting
             future.set_exception(exc)
             raise
-        future.set_result((result, ok, ms))
+        future.set_result((result, ok, ms, _now()))
 
 
 def _dispatch_round_concurrently(
@@ -347,7 +357,7 @@ def _dispatch_round_concurrently(
     With a single valid call there is nothing to overlap, and it runs inline.
 
     The calls run on the shared ``_tool_pool``, in ``min(tool_concurrency, calls)``
-    lanes.
+    lanes. Returns the round's wall time in ms: from dispatch to the last call's end.
     """
     parsed = [(tc, *_parse_tool_arguments(tc["arguments"])) for tc in calls]
     for tc, args, invalid in parsed:
@@ -357,25 +367,30 @@ def _dispatch_round_concurrently(
 
     valid = [i for i, (_, _, invalid) in enumerate(parsed) if invalid is None]
     if len(valid) <= 1:
+        wall_ms = 0  # at most one call runs, so its own time is the round's
         for tc, args, invalid in parsed:
             if invalid is not None:
                 yield finish_tool(tc["id"], tc["name"], invalid, False, 0)
                 continue
             result, ok, ms = _run_tool(dispatch, tc["name"], args, "Tool")
+            wall_ms = ms
             yield finish_tool(tc["id"], tc["name"], result, ok, ms)
-        return
+        return wall_ms
 
     # Contexts are copied here, on the caller's thread: a copy made in a pool thread
     # would hold that thread's variables, not the request's.
     futures = {i: Future() for i in valid}
     queue = deque((parsed[i][0]["name"], parsed[i][1], contextvars.copy_context(), futures[i]) for i in valid)
+    started = _now()
     lanes = [_tool_pool.submit(_run_lane, queue, dispatch) for _ in range(min(tool_concurrency, len(valid)))]
+    last_end = started
     try:
         for i, (tc, _, invalid) in enumerate(parsed):
             if invalid is not None:
                 yield finish_tool(tc["id"], tc["name"], invalid, False, 0)
                 continue
-            result, ok, ms = futures[i].result()
+            result, ok, ms, ended = futures[i].result()
+            last_end = max(last_end, ended)
             yield finish_tool(tc["id"], tc["name"], result, ok, ms)
     finally:
         # Normally every call is done by now. If the consumer closed the stream early, don't
@@ -384,6 +399,7 @@ def _dispatch_round_concurrently(
         queue.clear()
         for lane in lanes:
             lane.cancel()
+    return _ms(last_end - started)
 
 
 _LENGTH_RETRY_PROMPT = (
@@ -587,10 +603,9 @@ def stream_chat(
             )
             yield ToolCallEvent(name=name, arguments=args)
             logger.info("Pre-search: %s(%s)", name, args)
-            phase_started = _now()
             result, ok, ms = _run_tool(domain.dispatch, name, args, "Pre-search")
+            timer.record_tool_phase(ms)
             yield finish_tool(call_id, name, result, ok, ms)
-            timer.record_tool_phase(phase_started)
 
         for round_num in range(max_tool_rounds + 1):
             call_started = _now()
@@ -724,12 +739,11 @@ def stream_chat(
             messages.append(assistant_msg)
 
             calls = list(tool_calls_acc.values())
-            phase_started = _now()
             if tool_concurrency > 1 and len(calls) > 1:
-                yield from _dispatch_round_concurrently(calls, domain.dispatch, tool_concurrency, finish_tool)
+                wall_ms = yield from _dispatch_round_concurrently(calls, domain.dispatch, tool_concurrency, finish_tool)
             else:
-                yield from _dispatch_round_sequentially(calls, domain.dispatch, finish_tool)
-            timer.record_tool_phase(phase_started)
+                wall_ms = yield from _dispatch_round_sequentially(calls, domain.dispatch, finish_tool)
+            timer.record_tool_phase(wall_ms)
     except OutputFiltered as exc:
         # The answer stopped partway: the tokens already sent are not a
         # complete answer, so end on an error rather than a DoneEvent.

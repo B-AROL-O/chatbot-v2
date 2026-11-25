@@ -1276,6 +1276,67 @@ def test_wall_time_is_zero_without_tool_calls():
     assert done.usage["timings"]["tool_wall_ms"] == 0
 
 
+def _consume_slowly(stream, clock, ms, when=lambda event: True):
+    """Read ``stream`` like a slow client: after each event ``when`` accepts, the clock moves ``ms``.
+
+    The tests below use multiples of 125 ms, exact in binary: once the clock is past a few
+    seconds, a time like 100 ms no longer survives the subtraction and truncates to 99.
+    """
+    events = []
+    for event in stream:
+        events.append(event)
+        if when(event):
+            clock.advance_ms(ms)
+    return events
+
+
+def test_wall_time_of_sequential_calls_leaves_out_a_slow_client(monkeypatch):
+    """The loop is paused at each yield while the client reads it: not tool time (review on #17)."""
+    clock = FakeClock()
+    monkeypatch.setattr("sme_chatbot.core.chat._now", clock)
+    domain = make_domain(dispatch=_timed_dispatch(clock, {"search_a": 125, "search_b": 250}))
+
+    done = _consume_slowly(_stream(FakeStreamClient(_two_call_round()), domain, tool_concurrency=1), clock, 1000)[-1]
+
+    assert (done.usage["timings"]["tool_ms"], done.usage["timings"]["tool_wall_ms"]) == (375, 375)
+
+
+def test_wall_time_of_concurrent_calls_leaves_out_a_slow_client(monkeypatch):
+    clock = FakeClock()
+    monkeypatch.setattr("sme_chatbot.core.chat._now", clock)
+    both_started = threading.Barrier(2, timeout=5)
+    advanced = threading.Event()
+
+    def dispatch(name, args):
+        both_started.wait()
+        if name == "search_a":
+            clock.advance_ms(250)
+            advanced.set()
+        else:
+            assert advanced.wait(timeout=5)
+        return "{}"
+
+    # Not after search_a's result: search_b may still be ending then, and would read the moved clock.
+    def slow_here(event):
+        return not (isinstance(event, ToolResultEvent) and event.name == "search_a")
+
+    stream = _stream(FakeStreamClient(_two_call_round()), make_domain(dispatch=dispatch), tool_concurrency=4)
+    done = _consume_slowly(stream, clock, 1000, when=slow_here)[-1]
+
+    assert (done.usage["timings"]["tool_ms"], done.usage["timings"]["tool_wall_ms"]) == (500, 250)
+
+
+def test_wall_time_of_the_pre_search_leaves_out_a_slow_client(monkeypatch):
+    clock = FakeClock()
+    monkeypatch.setattr("sme_chatbot.core.chat._now", clock)
+    domain = _pre_search_domain(_timed_dispatch(clock, {"search_documents": 125}))
+    client = FakeStreamClient([[make_chunk(content="ok"), make_chunk(finish_reason="stop")]])
+
+    done = _consume_slowly(_stream(client, domain, pre_search=True), clock, 1000)[-1]
+
+    assert (done.usage["timings"]["tool_ms"], done.usage["timings"]["tool_wall_ms"]) == (125, 125)
+
+
 # ---------------------------------------------------------------------------
 # sampling settings: sent only when configured
 # ---------------------------------------------------------------------------

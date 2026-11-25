@@ -183,9 +183,12 @@ instead of an `error` event.
   silent thinking phase shows up there.
 - `tool_ms` is the sum of the tool calls' own times (`tools[].ms`).
   `tool_wall_ms` is the time the turn actually spent waiting for tools: the
-  pre-search plus each round's calls. When a round's calls run concurrently
-  (`CHAT_TOOL_CONCURRENCY` > 1) it is below `tool_ms`; one call per round, or
-  sequential calls, give about the same value for both.
+  pre-search plus each round's calls, from the first call's start to the last
+  call's end. Time the backend spends waiting for the client to read the
+  `tool_call`/`tool_result` events is not counted. When a round's calls run
+  concurrently (`CHAT_TOOL_CONCURRENCY` > 1) it is usually below `tool_ms`, and
+  includes any time the calls waited for a free thread in the shared pool. One
+  call per round, or sequential calls, give the same value for both.
 - `finish` is `tool_calls`, `stop`, or `forced_final` (the tools-less call made
   after hitting the round cap).
 - Token counts and cost are not part of `usage` yet.
