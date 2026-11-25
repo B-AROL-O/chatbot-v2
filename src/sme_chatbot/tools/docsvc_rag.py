@@ -178,24 +178,34 @@ _DENSE_WEIGHT = 0.5
 _LEXICAL_WEIGHT = 1.0
 
 
+def _open_lexical():
+    """The FTS5 index at ``LEXICAL_INDEX_PATH``, or ``False`` (with a warning) when unbuilt."""
+    from sme_chatbot.tools.lexical_index import LexicalIndex
+
+    index = LexicalIndex(config.LEXICAL_INDEX_PATH)
+    if index.exists():
+        return index
+    logger.warning(
+        "Lexical index %s not found; search_documents is dense-only. "
+        "Build it with `sme-ingest-docsvc --build-lexical-index`.",
+        config.LEXICAL_INDEX_PATH,
+    )
+    return False
+
+
 def _get_lexical():
-    """The FTS5 index, or ``None`` when hybrid retrieval is off or unbuilt."""
+    """The FTS5 index, or ``None`` when hybrid retrieval is off or unbuilt.
+
+    Thread-safe like ``_ensure_loaded``: concurrent first calls (two searches at once,
+    the startup warm-up) open one ``LexicalIndex`` and log one warning.
+    """
     global _lexical
     if config.RETRIEVAL_MODE != "hybrid":
         return None
     if _lexical is None:
-        from sme_chatbot.tools.lexical_index import LexicalIndex
-
-        index = LexicalIndex(config.LEXICAL_INDEX_PATH)
-        if index.exists():
-            _lexical = index
-        else:
-            logger.warning(
-                "Lexical index %s not found; search_documents is dense-only. "
-                "Build it with `sme-ingest-docsvc --build-lexical-index`.",
-                config.LEXICAL_INDEX_PATH,
-            )
-            _lexical = False
+        with _load_lock:
+            if _lexical is None:
+                _lexical = _open_lexical()
     return _lexical or None
 
 
