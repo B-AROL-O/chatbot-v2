@@ -50,6 +50,7 @@ EMBEDDING_MODEL = "paraphrase-multilingual-MiniLM-L12-v2"
 _model = None
 _collection = None
 _load_lock = threading.Lock()
+_encode_lock = threading.Lock()
 
 
 def _ensure_loaded() -> str | None:
@@ -91,6 +92,15 @@ def _ensure_loaded() -> str | None:
     return None
 
 
+def _embed(text: str) -> list[float]:
+    """Embed one query. Serialized: the module's one model is shared by every thread that
+    searches (concurrent requests, and the concurrent tool calls of one round), and its
+    HF fast tokenizer is not safe to call from two threads at once."""
+    with _encode_lock:
+        vector = _model.encode([text])[0]
+    return vector.tolist()
+
+
 # --- Startup warm-up --------------------------------------------
 
 
@@ -128,7 +138,7 @@ def warm_up(read_files: bool = False) -> None:
     logger.info("warm-up: model and collection loaded in %.1f s", time.perf_counter() - step)
 
     step = time.perf_counter()
-    _collection.query(query_embeddings=[_model.encode(["warm-up"])[0].tolist()], n_results=1)
+    _collection.query(query_embeddings=[_embed("warm-up")], n_results=1)
     _collection.get(where={"serial": "warm-up"}, limit=1)
     lexical = _get_lexical()
     if lexical is not None:
@@ -190,7 +200,7 @@ def _get_lexical():
 
 
 def _dense_hits(query: str, where: dict | None, k: int) -> list[tuple[str, str, dict, float | None]]:
-    vec = _model.encode([query])[0].tolist()
+    vec = _embed(query)
     query_kwargs = {"query_embeddings": [vec], "n_results": k}
     if where is not None:
         query_kwargs["where"] = where
