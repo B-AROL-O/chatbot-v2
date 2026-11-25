@@ -110,6 +110,7 @@ def create_app() -> FastAPI:
             "retry_reasoning_effort": config.LLM_RETRY_REASONING_EFFORT,
             "pre_search": config.CHAT_PRE_SEARCH,
             "pre_search_results": config.CHAT_PRE_SEARCH_RESULTS,
+            "tool_concurrency": config.CHAT_TOOL_CONCURRENCY,
             "auth_mode": config.AUTH_MODE,
             "domains": sorted(DOMAINS.keys()),
         }
@@ -149,6 +150,10 @@ def create_app() -> FastAPI:
                 ("retry_reasoning_effort", config.LLM_RETRY_REASONING_EFFORT),
                 ("pre_search", config.CHAT_PRE_SEARCH or None),
                 ("llm_api", None if config.LLM_API == "chat_completions" else config.LLM_API),
+                (
+                    "tool_concurrency",
+                    None if config.CHAT_TOOL_CONCURRENCY == config.DEFAULT_TOOL_CONCURRENCY else config.CHAT_TOOL_CONCURRENCY,
+                ),
             )
             if value is not None
         }
@@ -184,7 +189,7 @@ def _log_request(domain_key: str, identity: RequestIdentity, message: str, usage
     timings = usage.get("timings") or {}
     logger.info(
         "chat/message domain=%s user_id=%s message_len=%d rounds=%s round_limit_hit=%s "
-        "setup_ms=%s total_ms=%s ttft_ms=%s llm_ms=%s tool_ms=%s",
+        "setup_ms=%s total_ms=%s ttft_ms=%s llm_ms=%s tool_ms=%s tool_wall_ms=%s",
         domain_key,
         identity.user_id,
         len(message),
@@ -195,6 +200,7 @@ def _log_request(domain_key: str, identity: RequestIdentity, message: str, usage
         timings.get("ttft_ms"),
         timings.get("llm_ms"),
         timings.get("tool_ms"),
+        timings.get("tool_wall_ms"),
     )
 
 

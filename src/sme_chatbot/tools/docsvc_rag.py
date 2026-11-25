@@ -50,6 +50,7 @@ EMBEDDING_MODEL = "paraphrase-multilingual-MiniLM-L12-v2"
 _model = None
 _collection = None
 _load_lock = threading.Lock()
+_encode_lock = threading.Lock()
 
 
 def _ensure_loaded() -> str | None:
@@ -91,6 +92,15 @@ def _ensure_loaded() -> str | None:
     return None
 
 
+def _embed(text: str) -> list[float]:
+    """Embed one query. Serialized: the module's one model is shared by every thread that
+    searches (concurrent requests, and the concurrent tool calls of one round), and its
+    HF fast tokenizer is not safe to call from two threads at once."""
+    with _encode_lock:
+        vector = _model.encode([text])[0]
+    return vector.tolist()
+
+
 # --- Startup warm-up --------------------------------------------
 
 
@@ -128,7 +138,7 @@ def warm_up(read_files: bool = False) -> None:
     logger.info("warm-up: model and collection loaded in %.1f s", time.perf_counter() - step)
 
     step = time.perf_counter()
-    _collection.query(query_embeddings=[_model.encode(["warm-up"])[0].tolist()], n_results=1)
+    _collection.query(query_embeddings=[_embed("warm-up")], n_results=1)
     _collection.get(where={"serial": "warm-up"}, limit=1)
     lexical = _get_lexical()
     if lexical is not None:
@@ -168,29 +178,39 @@ _DENSE_WEIGHT = 0.5
 _LEXICAL_WEIGHT = 1.0
 
 
+def _open_lexical():
+    """The FTS5 index at ``LEXICAL_INDEX_PATH``, or ``False`` (with a warning) when unbuilt."""
+    from sme_chatbot.tools.lexical_index import LexicalIndex
+
+    index = LexicalIndex(config.LEXICAL_INDEX_PATH)
+    if index.exists():
+        return index
+    logger.warning(
+        "Lexical index %s not found; search_documents is dense-only. "
+        "Build it with `sme-ingest-docsvc --build-lexical-index`.",
+        config.LEXICAL_INDEX_PATH,
+    )
+    return False
+
+
 def _get_lexical():
-    """The FTS5 index, or ``None`` when hybrid retrieval is off or unbuilt."""
+    """The FTS5 index, or ``None`` when hybrid retrieval is off or unbuilt.
+
+    Thread-safe like ``_ensure_loaded``: concurrent first calls (two searches at once,
+    the startup warm-up) open one ``LexicalIndex`` and log one warning.
+    """
     global _lexical
     if config.RETRIEVAL_MODE != "hybrid":
         return None
     if _lexical is None:
-        from sme_chatbot.tools.lexical_index import LexicalIndex
-
-        index = LexicalIndex(config.LEXICAL_INDEX_PATH)
-        if index.exists():
-            _lexical = index
-        else:
-            logger.warning(
-                "Lexical index %s not found; search_documents is dense-only. "
-                "Build it with `sme-ingest-docsvc --build-lexical-index`.",
-                config.LEXICAL_INDEX_PATH,
-            )
-            _lexical = False
+        with _load_lock:
+            if _lexical is None:
+                _lexical = _open_lexical()
     return _lexical or None
 
 
 def _dense_hits(query: str, where: dict | None, k: int) -> list[tuple[str, str, dict, float | None]]:
-    vec = _model.encode([query])[0].tolist()
+    vec = _embed(query)
     query_kwargs = {"query_embeddings": [vec], "n_results": k}
     if where is not None:
         query_kwargs["where"] = where

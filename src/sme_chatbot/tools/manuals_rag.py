@@ -24,6 +24,7 @@ EMBEDDING_MODEL = "paraphrase-multilingual-MiniLM-L12-v2"
 _model = None
 _collection = None
 _load_lock = threading.Lock()
+_encode_lock = threading.Lock()
 
 
 def _ensure_loaded() -> str | None:
@@ -65,6 +66,15 @@ def _ensure_loaded() -> str | None:
     return None
 
 
+def _embed(text: str) -> list[float]:
+    """Embed one query. Serialized: the module's one model is shared by every thread that
+    searches (concurrent requests, and the concurrent tool calls of one round), and its
+    HF fast tokenizer is not safe to call from two threads at once."""
+    with _encode_lock:
+        vector = _model.encode([text])[0]
+    return vector.tolist()
+
+
 def search_manuals(query: str, n_results: int = 5) -> dict:
     """Semantic search over machine manuals.
 
@@ -77,7 +87,7 @@ def search_manuals(query: str, n_results: int = 5) -> dict:
     n_results = max(1, min(int(n_results), 20))
     logger.info("search_manuals: %r (n=%d)", query, n_results)
 
-    vec = _model.encode([query])[0].tolist()
+    vec = _embed(query)
     res = _collection.query(query_embeddings=[vec], n_results=n_results)
 
     docs = res.get("documents", [[]])[0]

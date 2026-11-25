@@ -665,3 +665,29 @@ def test_read_file_reads_the_whole_file(docsvc_rag_module, tmp_path):
     path.write_bytes(b"x" * 1000)
 
     assert docsvc_rag_module._read_file(path, chunk_size=64) == 1000
+
+
+def test_concurrent_first_lexical_lookups_build_one_index(docsvc_rag_module, monkeypatch, caplog):
+    """Two searches of one round can both reach ``_get_lexical`` first (review on #17)."""
+    from sme_chatbot.tools import lexical_index
+
+    built: list[str] = []
+
+    class _SlowMissingIndex:
+        def __init__(self, path):
+            built.append(path)
+            time.sleep(0.1)  # wide window for a second thread to race in
+
+        def exists(self):
+            return False
+
+    monkeypatch.setattr(lexical_index, "LexicalIndex", _SlowMissingIndex)
+    monkeypatch.setattr(docsvc_rag_module.config, "RETRIEVAL_MODE", "hybrid")
+    monkeypatch.setattr(docsvc_rag_module, "_lexical", None)
+
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        found = list(pool.map(lambda _: docsvc_rag_module._get_lexical(), range(4)))
+
+    assert found == [None] * 4
+    assert len(built) == 1
+    assert caplog.text.count("not found; search_documents is dense-only") == 1

@@ -63,3 +63,21 @@ def test_a_choice_defaults_to_the_first_and_rejects_junk(monkeypatch):
     monkeypatch.setenv("RETRIEVAL_WARMUP", "yes")
     with pytest.raises(ValueError, match=r"RETRIEVAL_WARMUP='yes' must be one of off, on, full"):
         config._get_choice("RETRIEVAL_WARMUP", choices)
+
+
+def test_a_positive_int_defaults_when_unset_and_rejects_zero_or_junk(monkeypatch):
+    """CHAT_TOOL_CONCURRENCY: 0 or a negative number would deadlock or crash the pool, so fail at startup."""
+    monkeypatch.delenv("CHAT_TOOL_CONCURRENCY", raising=False)
+    assert config._get_positive_int("CHAT_TOOL_CONCURRENCY", 4) == 4
+
+    monkeypatch.setenv("CHAT_TOOL_CONCURRENCY", " 1 ")
+    assert config._get_positive_int("CHAT_TOOL_CONCURRENCY", 4) == 1
+
+    for raw in ("0", "-2"):
+        monkeypatch.setenv("CHAT_TOOL_CONCURRENCY", raw)
+        with pytest.raises(ValueError, match=rf"CHAT_TOOL_CONCURRENCY={raw} must be at least 1"):
+            config._get_positive_int("CHAT_TOOL_CONCURRENCY", 4)
+
+    monkeypatch.setenv("CHAT_TOOL_CONCURRENCY", "four")
+    with pytest.raises(ValueError, match=r"CHAT_TOOL_CONCURRENCY='four' is not a valid int"):
+        config._get_positive_int("CHAT_TOOL_CONCURRENCY", 4)

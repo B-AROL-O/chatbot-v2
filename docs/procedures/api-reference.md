@@ -51,11 +51,25 @@ etc.) are never included.
 {
   "version": "0.5.2",
   "model": "gpt-6-luna",
+  "llm_api": "chat_completions",
   "llm_base_url": "https://...",
+  "temperature": null,
+  "seed": null,
+  "max_tokens": null,
+  "reasoning_effort": null,
+  "retry_reasoning_effort": null,
+  "pre_search": false,
+  "pre_search_results": null,
+  "tool_concurrency": 4,
   "auth_mode": "dev",
   "domains": ["documents", "sample_cdo", "sample_manuals"]
 }
 ```
+
+Each field reflects one backend setting from `.env.example` (`LLM_*`,
+`CHAT_PRE_SEARCH*`, `CHAT_TOOL_CONCURRENCY`, `AUTH_MODE`); `null` means unset,
+so the LLM server's own default applies. `sme-chatbot-eval` records this
+response with every run, so two runs can be told apart by their settings.
 
 ## `POST /chat/message`
 
@@ -94,6 +108,31 @@ Response is `text/event-stream` (via `sse-starlette`). Client renders
 | `done` | `{"content": "<full answer>", "citations": [Citation, ...], "usage": Usage}` | Terminal on success |
 | `error` | `{"message": "..."}` | Terminal, sent instead of `done` |
 
+#### Order of `tool_call` and `tool_result` events
+
+When the model asks for several tools in one round, the backend runs them
+concurrently, up to `CHAT_TOOL_CONCURRENCY` (default `4`) at a time. The
+calls of these concurrent rounds share one pool of 8 threads across all
+requests, so they never use more than 8 threads however many requests are in
+flight. The round then sends every `tool_call` event first, followed by the `tool_result` events
+in the same order as the calls, whatever order the calls finish in:
+
+```text
+tool_call A, tool_call B, tool_result A, tool_result B
+```
+
+With `CHAT_TOOL_CONCURRENCY=1`, and for any round with a single call, each
+`tool_call` is followed directly by its `tool_result`:
+
+```text
+tool_call A, tool_result A, tool_call B, tool_result B
+```
+
+So don't assume a `tool_result` comes right after its `tool_call`. In both
+modes, each `tool_result` belongs to the oldest `tool_call` that has no result
+yet (first in, first out), and their `name` fields agree. `done.citations`
+lists citations in call order either way.
+
 ### `stream: false` — single JSON response
 
 Same fields as the `done` event, returned as one `ChatResponse` body once
@@ -118,6 +157,7 @@ instead of an `error` event.
     "ttft_ms": 800,
     "llm_ms": 650,
     "tool_ms": 250,
+    "tool_wall_ms": 250,
     "llm_calls": [
       {"round": 0, "first_chunk_ms": 100, "total_ms": 150, "finish": "tool_calls"},
       {"round": 1, "first_chunk_ms": 400, "total_ms": 500, "finish": "stop"}
@@ -141,6 +181,14 @@ instead of an `error` event.
   (`<think>`-stripped) token, and is `null` if none was emitted.
   `first_chunk_ms` of each LLM call is the first chunk of any kind, so a long
   silent thinking phase shows up there.
+- `tool_ms` is the sum of the tool calls' own times (`tools[].ms`).
+  `tool_wall_ms` is the time the turn actually spent waiting for tools: the
+  pre-search plus each round's calls, from the first call's start to the last
+  call's end. Time the backend spends waiting for the client to read the
+  `tool_call`/`tool_result` events is not counted. When a round's calls run
+  concurrently (`CHAT_TOOL_CONCURRENCY` > 1) it is usually below `tool_ms`, and
+  includes any time the calls waited for a free thread in the shared pool. One
+  call per round, or sequential calls, give the same value for both.
 - `finish` is `tool_calls`, `stop`, or `forced_final` (the tools-less call made
   after hitting the round cap).
 - Token counts and cost are not part of `usage` yet.

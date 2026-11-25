@@ -13,8 +13,13 @@ All fixtures/fakes live in this file per the WP8a file-ownership split (no
 
 from __future__ import annotations
 
+import contextvars
 import json
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
+
+import pytest
 
 from sme_chatbot.core.chat import stream_chat
 from sme_chatbot.core.domains import DomainConfig
@@ -90,6 +95,13 @@ def make_domain(dispatch=None, tool_definitions=None) -> DomainConfig:
         system_prompt="You are a test assistant.",
         tool_definitions=tool_definitions or [],
         dispatch=dispatch or (lambda name, args: "{}"),
+    )
+
+
+def _stream(client, domain, message="hi", **kwargs):
+    """``stream_chat`` with the test defaults, not yet consumed."""
+    return stream_chat(
+        client, model="m", domain=domain, message=message, history=[], identity=RequestIdentity(user_id="u1"), **kwargs
     )
 
 
@@ -337,6 +349,322 @@ def test_broken_json_tool_arguments_survives_and_continues():
     assert len(tool_messages) == 1
     error_payload = json.loads(tool_messages[0]["content"])
     assert "error" in error_payload
+
+
+def _two_call_round(second_arguments='{"q": "b"}'):
+    """One LLM round asking for two tool calls, then an answer round."""
+    return [
+        [
+            make_chunk(tool_calls=[make_tool_call_delta(0, id_="call_a", name="search_a", arguments='{"q": "a"}')]),
+            make_chunk(tool_calls=[make_tool_call_delta(1, id_="call_b", name="search_b", arguments=second_arguments)]),
+            make_chunk(finish_reason="tool_calls"),
+        ],
+        [make_chunk(content="Done."), make_chunk(finish_reason="stop")],
+    ]
+
+
+def _citing_dispatch(name, args):
+    return json.dumps({"results": [{"source": f"{name}.pdf", "page": 1}]})
+
+
+def test_two_calls_in_one_round_run_in_order_with_interleaved_events():
+    """Pins the sequential behaviour that ``tool_concurrency=1`` must keep exactly."""
+    ran = []
+
+    def dispatch(name, args):
+        ran.append((name, args))
+        return _citing_dispatch(name, args)
+
+    client = FakeStreamClient(_two_call_round())
+
+    events = run(client, dispatch=dispatch, tool_concurrency=1)
+
+    assert [(type(e).__name__, getattr(e, "name", None)) for e in events] == [
+        ("ToolCallEvent", "search_a"),
+        ("ToolResultEvent", "search_a"),
+        ("ToolCallEvent", "search_b"),
+        ("ToolResultEvent", "search_b"),
+        ("TokenEvent", None),
+        ("DoneEvent", None),
+    ]
+    assert ran == [("search_a", {"q": "a"}), ("search_b", {"q": "b"})]
+    done = events[-1]
+    assert [c.source for c in done.citations] == ["search_a.pdf", "search_b.pdf"]
+    assert [t["name"] for t in done.usage["timings"]["tools"]] == ["search_a", "search_b"]
+    messages = client.calls[1]["messages"]
+    assert [tc["id"] for tc in messages[-3]["tool_calls"]] == ["call_a", "call_b"]
+    assert [(m["role"], m["tool_call_id"]) for m in messages[-2:]] == [("tool", "call_a"), ("tool", "call_b")]
+
+
+# ---------------------------------------------------------------------------
+# tool calls of one round run concurrently (issue #4)
+# ---------------------------------------------------------------------------
+
+
+def _event_names(events):
+    return [(type(e).__name__, getattr(e, "name", None)) for e in events]
+
+
+def _tool_messages(client):
+    return [(m["tool_call_id"], json.loads(m["content"])) for m in client.calls[1]["messages"] if m["role"] == "tool"]
+
+
+@pytest.mark.parametrize(("tool_concurrency", "overlap"), [(2, True), (1, False)])
+def test_two_slow_calls_overlap_only_when_concurrency_allows_it(tool_concurrency, overlap):
+    # Each call waits for the other at the barrier: it is passed only if both run at once.
+    # Sequential calls can never meet there, so they time out (quickly) and fail instead.
+    barrier = threading.Barrier(2, timeout=5 if overlap else 0.05)
+
+    def dispatch(name, args):
+        barrier.wait()
+        return _citing_dispatch(name, args)
+
+    client = FakeStreamClient(_two_call_round())
+
+    events = run(client, dispatch=dispatch, tool_concurrency=tool_concurrency)
+
+    assert [e.ok for e in events if isinstance(e, ToolResultEvent)] == [overlap, overlap]
+    assert isinstance(events[-1], DoneEvent)
+
+
+def test_concurrent_calls_send_every_call_first_then_results_in_call_order():
+    """The second call finishes first; events, messages, citations and timings keep call order."""
+    b_done = threading.Event()
+
+    def dispatch(name, args):
+        if name == "search_a":
+            assert b_done.wait(timeout=5), "search_b never finished: the calls did not overlap"
+        else:
+            b_done.set()
+        return _citing_dispatch(name, args)
+
+    client = FakeStreamClient(_two_call_round())
+
+    events = run(client, dispatch=dispatch, tool_concurrency=4)
+
+    assert _event_names(events) == [
+        ("ToolCallEvent", "search_a"),
+        ("ToolCallEvent", "search_b"),
+        ("ToolResultEvent", "search_a"),
+        ("ToolResultEvent", "search_b"),
+        ("TokenEvent", None),
+        ("DoneEvent", None),
+    ]
+    assert [e.arguments for e in events[:2]] == [{"q": "a"}, {"q": "b"}]
+    assert all(e.ok for e in events if isinstance(e, ToolResultEvent))
+    done = events[-1]
+    assert [c.source for c in done.citations] == ["search_a.pdf", "search_b.pdf"]
+    assert [t["name"] for t in done.usage["timings"]["tools"]] == ["search_a", "search_b"]
+    assert [call_id for call_id, _ in _tool_messages(client)] == ["call_a", "call_b"]
+
+
+def test_a_failing_concurrent_call_does_not_affect_the_other():
+    def dispatch(name, args):
+        if name == "search_a":
+            raise RuntimeError("chroma down")
+        return _citing_dispatch(name, args)
+
+    client = FakeStreamClient(_two_call_round())
+
+    events = run(client, dispatch=dispatch, tool_concurrency=4)
+
+    results = [e for e in events if isinstance(e, ToolResultEvent)]
+    assert [(r.name, r.ok) for r in results] == [("search_a", False), ("search_b", True)]
+    assert results[0].citations == []
+    assert [c.source for c in events[-1].citations] == ["search_b.pdf"]
+    (_, a_payload), (_, b_payload) = _tool_messages(client)
+    assert "chroma down" in a_payload["error"]
+    assert "results" in b_payload
+    assert [t["ok"] for t in events[-1].usage["timings"]["tools"]] == [False, True]
+
+
+def test_invalid_arguments_next_to_a_valid_call_are_rejected_without_dispatch():
+    ran = []
+
+    def dispatch(name, args):
+        ran.append((name, threading.current_thread()))
+        return _citing_dispatch(name, args)
+
+    client = FakeStreamClient(_two_call_round(second_arguments="{oops"))
+
+    events = run(client, dispatch=dispatch, tool_concurrency=4)
+
+    assert _event_names(events)[:4] == [
+        ("ToolCallEvent", "search_a"),
+        ("ToolCallEvent", "search_b"),
+        ("ToolResultEvent", "search_a"),
+        ("ToolResultEvent", "search_b"),
+    ]
+    assert events[1].arguments == {}
+    assert [e.ok for e in events if isinstance(e, ToolResultEvent)] == [True, False]
+    # Only one call left to run: nothing to overlap, so it runs inline.
+    assert ran == [("search_a", threading.current_thread())]
+    assert "Invalid arguments" in _tool_messages(client)[1][1]["error"]
+    assert events[-1].usage["timings"]["tools"][1] == {"name": "search_b", "ms": 0, "ok": False}
+
+
+def test_a_single_call_runs_inline_on_the_loop_thread():
+    threads = []
+
+    def dispatch(name, args):
+        threads.append(threading.current_thread())
+        return "{}"
+
+    run(FakeStreamClient(_tool_round_then_answer()), dispatch=dispatch, tool_concurrency=4)
+
+    assert threads == [threading.current_thread()]
+
+
+class _PeakRecordingDispatch:
+    """A dispatch whose calls each stay busy until ``all_calls`` run at once, or a short timeout.
+
+    So ``peak`` ends up exactly the number of calls that were let run together.
+    """
+
+    def __init__(self, all_calls):
+        self._all_running = threading.Condition()
+        self._all_calls = all_calls
+        self._active = 0
+        self.peak = 0
+
+    def __call__(self, name, args):
+        with self._all_running:
+            self._active += 1
+            self.peak = max(self.peak, self._active)
+            self._all_running.notify_all()
+            self._all_running.wait_for(lambda: self._active >= self._all_calls, timeout=0.3)
+            self._active -= 1
+        return "{}"
+
+
+@pytest.mark.parametrize(("tool_concurrency", "expected_peak"), [(2, 2), (3, 3)])
+def test_no_more_calls_run_at_once_than_tool_concurrency(tool_concurrency, expected_peak):
+    dispatch = _PeakRecordingDispatch(all_calls=3)
+
+    client = FakeStreamClient(
+        [
+            [
+                make_chunk(tool_calls=[make_tool_call_delta(i, id_=f"call_{n}", name=f"search_{n}", arguments="{}")])
+                for i, n in enumerate("abc")
+            ]
+            + [make_chunk(finish_reason="tool_calls")],
+            [make_chunk(content="ok"), make_chunk(finish_reason="stop")],
+        ]
+    )
+
+    events = run(client, dispatch=dispatch, tool_concurrency=tool_concurrency)
+
+    assert dispatch.peak == expected_peak
+    assert [e.ok for e in events if isinstance(e, ToolResultEvent)] == [True, True, True]
+
+
+def test_closing_the_stream_mid_round_does_not_wait_for_a_running_call():
+    """A client that disconnects must not hold its request thread until a slow tool returns."""
+    release = threading.Event()
+    b_finished = threading.Event()
+
+    def dispatch(name, args):
+        if name == "search_b":
+            release.wait(timeout=5)
+            b_finished.set()
+        return "{}"
+
+    stream = _stream(FakeStreamClient(_two_call_round()), make_domain(dispatch=dispatch), tool_concurrency=4)
+    first_result = next(e for e in stream if isinstance(e, ToolResultEvent))
+    assert first_result.name == "search_a"
+
+    stream.close()  # search_b is still blocked in its worker thread
+
+    closed_before_b_finished = not b_finished.is_set()
+    release.set()
+    assert closed_before_b_finished
+
+
+_request_tag: contextvars.ContextVar[str] = contextvars.ContextVar("request_tag", default="unset")
+
+
+def test_concurrent_calls_see_the_callers_context_variables():
+    seen = []
+    main_thread = threading.current_thread()
+
+    def dispatch(name, args):
+        seen.append((name, _request_tag.get(), threading.current_thread() is main_thread))
+        _request_tag.set(f"changed by {name}")  # must not leak into the caller or the other call
+        return "{}"
+
+    token = _request_tag.set("req-42")
+    try:
+        run(FakeStreamClient(_two_call_round()), dispatch=dispatch, tool_concurrency=4)
+        assert _request_tag.get() == "req-42"
+    finally:
+        _request_tag.reset(token)
+
+    assert sorted(seen) == [("search_a", "req-42", False), ("search_b", "req-42", False)]
+
+
+@pytest.fixture()
+def tool_pool(monkeypatch):
+    """Swap the shared tool pool for a fresh one of the given size; shut down after the test."""
+    pools = []
+
+    def make(size):
+        pool = ThreadPoolExecutor(max_workers=size, thread_name_prefix="test-tool")
+        monkeypatch.setattr("sme_chatbot.core.chat._tool_pool", pool)
+        pools.append(pool)
+        return pool
+
+    yield make
+    for pool in pools:
+        pool.shutdown(wait=True)
+
+
+def test_the_tool_calls_of_all_requests_share_one_capped_pool(tool_pool):
+    """Two requests with two calls each, on a pool of 3: never 4 calls at once (review on #17)."""
+    tool_pool(3)
+    dispatch = _PeakRecordingDispatch(all_calls=4)
+
+    def one_request(_):
+        return run(FakeStreamClient(_two_call_round()), dispatch=dispatch, tool_concurrency=4)
+
+    with ThreadPoolExecutor(max_workers=2) as requests:
+        results = list(requests.map(one_request, range(2)))
+
+    assert dispatch.peak == 3
+    assert all(isinstance(events[-1], DoneEvent) for events in results)
+
+
+def test_closing_the_stream_mid_round_never_starts_the_calls_still_queued(tool_pool):
+    """The shared pool can't be shut down per round: the round's queued calls are dropped instead."""
+    pool = tool_pool(4)
+    release = threading.Event()
+    ran = []
+
+    def dispatch(name, args):
+        ran.append(name)
+        release.wait(timeout=5)
+        return "{}"
+
+    calls = [("x", "{oops"), ("a", "{}"), ("b", "{}"), ("c", "{}")]
+    client = FakeStreamClient(
+        [
+            [
+                make_chunk(tool_calls=[make_tool_call_delta(i, id_=f"call_{n}", name=f"search_{n}", arguments=a)])
+                for i, (n, a) in enumerate(calls)
+            ]
+            + [make_chunk(finish_reason="tool_calls")],
+            [make_chunk(content="ok"), make_chunk(finish_reason="stop")],
+        ]
+    )
+    stream = _stream(client, make_domain(dispatch=dispatch), tool_concurrency=2)
+    # The invalid call's result comes back at once, while a and b hold both slots.
+    first_result = next(e for e in stream if isinstance(e, ToolResultEvent))
+    assert (first_result.name, first_result.ok) == ("search_x", False)
+
+    stream.close()
+    release.set()
+    pool.shutdown(wait=True)
+
+    assert set(ran) <= {"search_a", "search_b"}
 
 
 # ---------------------------------------------------------------------------
@@ -886,6 +1214,129 @@ def test_timings_record_a_tool_with_broken_arguments_as_not_ok():
     assert done.usage["timings"]["tools"] == [{"name": "t", "ms": 0, "ok": False}]
 
 
+def _timed_dispatch(clock, ms_by_name):
+    def dispatch(name, args):
+        clock.advance_ms(ms_by_name[name])
+        return "{}"
+
+    return dispatch
+
+
+def test_sequential_calls_have_equal_tool_and_wall_time(monkeypatch):
+    clock = FakeClock()
+    monkeypatch.setattr("sme_chatbot.core.chat._now", clock)
+    client = FakeStreamClient(_two_call_round())
+
+    done = run(client, dispatch=_timed_dispatch(clock, {"search_a": 100, "search_b": 150}), tool_concurrency=1)[-1]
+
+    timings = done.usage["timings"]
+    assert timings["tools"] == [
+        {"name": "search_a", "ms": 100, "ok": True},
+        {"name": "search_b", "ms": 150, "ok": True},
+    ]
+    assert (timings["tool_ms"], timings["tool_wall_ms"]) == (250, 250)
+
+
+def test_overlapping_calls_count_once_in_wall_time_but_fully_in_tool_time(monkeypatch):
+    clock = FakeClock()
+    monkeypatch.setattr("sme_chatbot.core.chat._now", clock)
+    both_started = threading.Barrier(2, timeout=5)
+    advanced = threading.Event()
+
+    def dispatch(name, args):
+        both_started.wait()  # both calls have read their start time
+        if name == "search_a":
+            clock.advance_ms(300)
+            advanced.set()
+        else:
+            assert advanced.wait(timeout=5)
+        return "{}"
+
+    done = run(FakeStreamClient(_two_call_round()), dispatch=dispatch, tool_concurrency=4)[-1]
+
+    timings = done.usage["timings"]
+    assert [t["ms"] for t in timings["tools"]] == [300, 300]
+    assert (timings["tool_ms"], timings["tool_wall_ms"]) == (600, 300)
+
+
+def test_wall_time_adds_up_the_pre_search_and_every_round(monkeypatch):
+    clock = FakeClock()
+    monkeypatch.setattr("sme_chatbot.core.chat._now", clock)
+    domain = _pre_search_domain(_timed_dispatch(clock, {"search_documents": 100, "t": 40}))
+    client = FakeStreamClient(_tool_round_then_answer())
+
+    done = _run_domain(client, domain, pre_search=True)[-1]
+
+    assert (done.usage["timings"]["tool_ms"], done.usage["timings"]["tool_wall_ms"]) == (140, 140)
+
+
+def test_wall_time_is_zero_without_tool_calls():
+    done = run(FakeStreamClient([[make_chunk(content="ok", finish_reason="stop")]]))[-1]
+
+    assert done.usage["timings"]["tool_wall_ms"] == 0
+
+
+def _consume_slowly(stream, clock, ms, when=lambda event: True):
+    """Read ``stream`` like a slow client: after each event ``when`` accepts, the clock moves ``ms``.
+
+    The tests below use multiples of 125 ms, exact in binary: once the clock is past a few
+    seconds, a time like 100 ms no longer survives the subtraction and truncates to 99.
+    """
+    events = []
+    for event in stream:
+        events.append(event)
+        if when(event):
+            clock.advance_ms(ms)
+    return events
+
+
+def test_wall_time_of_sequential_calls_leaves_out_a_slow_client(monkeypatch):
+    """The loop is paused at each yield while the client reads it: not tool time (review on #17)."""
+    clock = FakeClock()
+    monkeypatch.setattr("sme_chatbot.core.chat._now", clock)
+    domain = make_domain(dispatch=_timed_dispatch(clock, {"search_a": 125, "search_b": 250}))
+
+    done = _consume_slowly(_stream(FakeStreamClient(_two_call_round()), domain, tool_concurrency=1), clock, 1000)[-1]
+
+    assert (done.usage["timings"]["tool_ms"], done.usage["timings"]["tool_wall_ms"]) == (375, 375)
+
+
+def test_wall_time_of_concurrent_calls_leaves_out_a_slow_client(monkeypatch):
+    clock = FakeClock()
+    monkeypatch.setattr("sme_chatbot.core.chat._now", clock)
+    both_started = threading.Barrier(2, timeout=5)
+    advanced = threading.Event()
+
+    def dispatch(name, args):
+        both_started.wait()
+        if name == "search_a":
+            clock.advance_ms(250)
+            advanced.set()
+        else:
+            assert advanced.wait(timeout=5)
+        return "{}"
+
+    # Not after search_a's result: search_b may still be ending then, and would read the moved clock.
+    def slow_here(event):
+        return not (isinstance(event, ToolResultEvent) and event.name == "search_a")
+
+    stream = _stream(FakeStreamClient(_two_call_round()), make_domain(dispatch=dispatch), tool_concurrency=4)
+    done = _consume_slowly(stream, clock, 1000, when=slow_here)[-1]
+
+    assert (done.usage["timings"]["tool_ms"], done.usage["timings"]["tool_wall_ms"]) == (500, 250)
+
+
+def test_wall_time_of_the_pre_search_leaves_out_a_slow_client(monkeypatch):
+    clock = FakeClock()
+    monkeypatch.setattr("sme_chatbot.core.chat._now", clock)
+    domain = _pre_search_domain(_timed_dispatch(clock, {"search_documents": 125}))
+    client = FakeStreamClient([[make_chunk(content="ok"), make_chunk(finish_reason="stop")]])
+
+    done = _consume_slowly(_stream(client, domain, pre_search=True), clock, 1000)[-1]
+
+    assert (done.usage["timings"]["tool_ms"], done.usage["timings"]["tool_wall_ms"]) == (125, 125)
+
+
 # ---------------------------------------------------------------------------
 # sampling settings: sent only when configured
 # ---------------------------------------------------------------------------
@@ -1147,10 +1598,7 @@ def _pre_search_domain(dispatch):
 
 
 def _run_domain(client, domain, **kwargs):
-    return list(
-        stream_chat(client, model="m", domain=domain, message="Quanto pesa la 90001?", history=[],
-                    identity=RequestIdentity(user_id="u1"), **kwargs)
-    )
+    return list(_stream(client, domain, message="Quanto pesa la 90001?", **kwargs))
 
 
 def test_pre_search_runs_before_the_first_llm_call_as_a_tool_call_and_result():

@@ -408,7 +408,7 @@ def _fake_turn_with_timings(client, model, domain, message, history, identity, m
         citations=[],
         usage={
             "rounds": 2,
-            "timings": {"total_ms": 900, "ttft_ms": 800, "llm_ms": 650, "tool_ms": 250},
+            "timings": {"total_ms": 900, "ttft_ms": 800, "llm_ms": 650, "tool_ms": 250, "tool_wall_ms": 180},
         },
     )
 
@@ -469,6 +469,7 @@ def test_request_log_carries_durations_but_not_the_message(app_client, set_strea
     assert "ttft_ms=800" in line
     assert "llm_ms=650" in line
     assert "tool_ms=250" in line
+    assert "tool_wall_ms=180" in line
     assert "setup_ms=" in line
     assert "SEGRETO-DEL-CLIENTE" not in line
 
@@ -580,6 +581,19 @@ def test_pre_search_reaches_stream_chat_and_config_only_when_enabled(app_client,
     app_client.post("/chat/message", json={"domain": "sample_manuals", "message": "hi", "stream": False})
     assert seen["sampling"] == {"pre_search": True}
     assert app_client.get("/config").json()["pre_search"] is True
+
+
+def test_tool_concurrency_reaches_stream_chat_only_when_not_the_default(app_client, set_stream_chat, monkeypatch):
+    seen: dict = {}
+    set_stream_chat(_capture_sampling(seen))
+    app_client.post("/chat/message", json={"domain": "sample_manuals", "message": "hi", "stream": False})
+    assert "tool_concurrency" not in seen["sampling"]
+    assert app_client.get("/config").json()["tool_concurrency"] == 4
+
+    monkeypatch.setattr(config, "CHAT_TOOL_CONCURRENCY", 1)
+    app_client.post("/chat/message", json={"domain": "sample_manuals", "message": "hi", "stream": False})
+    assert seen["sampling"] == {"tool_concurrency": 1}
+    assert app_client.get("/config").json()["tool_concurrency"] == 1
 
 
 def test_pre_search_results_sets_n_results_on_the_pre_search_only(app_client, set_stream_chat, monkeypatch):

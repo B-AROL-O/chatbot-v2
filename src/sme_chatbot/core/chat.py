@@ -24,10 +24,16 @@ Differences from the legacy version:
 
 from __future__ import annotations
 
+import contextvars
 import json
 import logging
 import time
-from collections.abc import Iterator
+from collections import deque
+from collections.abc import Callable, Iterator
+from concurrent.futures import Future, ThreadPoolExecutor
+from functools import partial
+
+from sme_chatbot.config import DEFAULT_TOOL_CONCURRENCY
 
 from .content_filter import OutputFiltered, categories_in, describe_block, filtered_categories
 from .domains import DomainConfig
@@ -71,6 +77,7 @@ class _TurnTimer:
         self.ttft_ms: int | None = None
         self.llm_calls: list[dict] = []
         self.tools: list[dict] = []
+        self.tool_wall_ms = 0
 
     def mark_visible(self) -> None:
         if self.ttft_ms is None:
@@ -88,8 +95,16 @@ class _TurnTimer:
             }
         )
 
-    def record_tool(self, name: str, started: float, ok: bool) -> None:
-        self.tools.append({"name": name, "ms": _ms(_now() - started), "ok": ok})
+    def record_tool(self, name: str, ms: int, ok: bool) -> None:
+        self.tools.append({"name": name, "ms": ms, "ok": ok})
+
+    def record_tool_phase(self, wall_ms: int) -> None:
+        """Add the wall time of one tool phase (a round's calls, or the pre-search).
+
+        Measured from the calls' own start and end times, so the time the loop spends
+        paused at a ``yield`` while the client reads an event is not counted.
+        """
+        self.tool_wall_ms += wall_ms
 
     def usage(self, rounds: int, round_limit_hit: bool = False) -> dict:
         return {
@@ -101,7 +116,10 @@ class _TurnTimer:
                 "total_ms": _ms(_now() - self._start),
                 "ttft_ms": self.ttft_ms,
                 "llm_ms": sum(c["total_ms"] for c in self.llm_calls),
+                # Sum of the calls' own times: comparable with runs made before calls overlapped.
                 "tool_ms": sum(t["ms"] for t in self.tools),
+                # Time actually spent waiting for tools; below tool_ms when calls overlapped.
+                "tool_wall_ms": self.tool_wall_ms,
                 "llm_calls": self.llm_calls,
                 "tools": self.tools,
             },
@@ -221,6 +239,167 @@ def _extract_citations(tool_result_json: str) -> list[Citation]:
             )
         )
     return citations
+
+
+def _parse_tool_arguments(raw: str) -> tuple[dict | None, str | None]:
+    """``(arguments, None)``, or ``(None, error_result)`` when ``raw`` is not valid JSON.
+
+    A call with invalid arguments is never dispatched: the error result goes back to the model instead.
+    """
+    try:
+        return json.loads(raw or "{}"), None
+    except json.JSONDecodeError as exc:
+        return None, json.dumps({"error": f"Invalid arguments: {exc}"})
+
+
+def _run_tool(dispatch, name: str, args: dict, label: str) -> tuple[str, bool, int]:
+    """Dispatch one tool call. Returns ``(result, ok, ms)``.
+
+    Touches no state of the turn, so it can run off the loop's thread: the caller records
+    the outcome with ``_finish_tool``. ``label`` names the call in the failure log.
+    """
+    started = _now()
+    try:
+        result = dispatch(name, args)
+        ok = True
+    except Exception as exc:  # broad on purpose: never crash the chat loop
+        logger.exception("%s %s failed", label, name)
+        result = json.dumps({"error": f"Tool {name} failed: {exc}"})
+        ok = False
+    return result, ok, _ms(_now() - started)
+
+
+def _finish_tool(
+    call_id: str,
+    name: str,
+    result: str,
+    ok: bool,
+    ms: int,
+    messages: list[dict],
+    timer: _TurnTimer,
+    all_citations: list[Citation],
+) -> ToolResultEvent:
+    """Record one finished tool call in the turn: timing, citations, tool message. Returns its event."""
+    timer.record_tool(name, ms, ok)
+    citations = _extract_citations(result) if ok else []
+    all_citations.extend(citations)
+    messages.append({"role": "tool", "tool_call_id": call_id, "content": result})
+    return ToolResultEvent(name=name, ok=ok, citations=citations)
+
+
+# ``_finish_tool`` with the turn's ``messages``, ``timer`` and ``all_citations`` bound:
+# ``finish_tool(call_id, name, result, ok, ms) -> ToolResultEvent``.
+_FinishTool = Callable[[str, str, str, bool, int], ToolResultEvent]
+
+
+def _dispatch_round_sequentially(calls: list[dict], dispatch, finish_tool: _FinishTool) -> Iterator[ChatEvent]:
+    """Run one round's tool calls one after another: each ``ToolCallEvent``, then its result.
+
+    Returns the round's wall time in ms: the sum of the calls' own times.
+    """
+    wall_ms = 0
+    for tc in calls:
+        args, invalid = _parse_tool_arguments(tc["arguments"])
+        if invalid is not None:
+            yield ToolCallEvent(name=tc["name"], arguments={})
+            yield finish_tool(tc["id"], tc["name"], invalid, False, 0)
+            continue
+
+        yield ToolCallEvent(name=tc["name"], arguments=args)
+        logger.info("Tool call: %s(%s)", tc["name"], args)
+        result, ok, ms = _run_tool(dispatch, tc["name"], args, "Tool")
+        wall_ms += ms
+        yield finish_tool(tc["id"], tc["name"], result, ok, ms)
+    return wall_ms
+
+
+# The calls of every concurrent round, of every request, run on this one pool, so the
+# threads they use stay capped however many requests run, or disconnect and leave their
+# calls running. ``CHAT_TOOL_CONCURRENCY`` limits each round; this limits the process.
+# Both encoding and Chroma use the CPU, so more threads than this would gain little.
+# A ``ThreadPoolExecutor`` starts its threads on ``submit``, not here at import.
+_tool_pool = ThreadPoolExecutor(max_workers=8, thread_name_prefix="tool")
+
+
+def _run_lane(queue: deque, dispatch) -> None:
+    """Run calls from ``queue`` one at a time until it is empty; one lane per concurrent slot.
+
+    Each job is ``(name, args, context, future)``: the call runs in ``context`` and its
+    ``(result, ok, ms, ended)`` goes to ``future``. Pulling from a shared queue refills a
+    slot as soon as any call of the round ends, without waiting for the loop's thread.
+    ``popleft`` is atomic, so lanes need no lock to share the queue.
+    """
+    while True:
+        try:
+            name, args, context, future = queue.popleft()
+        except IndexError:
+            return
+        try:
+            result, ok, ms = context.run(_run_tool, dispatch, name, args, "Tool")
+        except BaseException as exc:  # _run_tool catches Exception; never leave the loop waiting
+            future.set_exception(exc)
+            raise
+        future.set_result((result, ok, ms, _now()))
+
+
+def _dispatch_round_concurrently(
+    calls: list[dict], dispatch, tool_concurrency: int, finish_tool: _FinishTool
+) -> Iterator[ChatEvent]:
+    """Run one round's tool calls at the same time, up to ``tool_concurrency`` at once.
+
+    Every ``ToolCallEvent`` of the round comes first, then the ``ToolResultEvent``s in the
+    model's call order, each as soon as it and the calls before it are done. Results, tool
+    messages, citations and timings are all recorded here, on the loop's thread, in call
+    order, whatever order the calls finish in, so the conversation stays deterministic.
+
+    A call with invalid arguments is never dispatched. Each dispatched call runs in its own
+    copy of the caller's context: one ``Context`` cannot be entered by two threads at once.
+    With a single valid call there is nothing to overlap, and it runs inline.
+
+    The calls run on the shared ``_tool_pool``, in ``min(tool_concurrency, calls)``
+    lanes. Returns the round's wall time in ms: from dispatch to the last call's end.
+    """
+    parsed = [(tc, *_parse_tool_arguments(tc["arguments"])) for tc in calls]
+    for tc, args, invalid in parsed:
+        yield ToolCallEvent(name=tc["name"], arguments={} if invalid is not None else args)
+        if invalid is None:
+            logger.info("Tool call: %s(%s)", tc["name"], args)
+
+    valid = [i for i, (_, _, invalid) in enumerate(parsed) if invalid is None]
+    if len(valid) <= 1:
+        wall_ms = 0  # at most one call runs, so its own time is the round's
+        for tc, args, invalid in parsed:
+            if invalid is not None:
+                yield finish_tool(tc["id"], tc["name"], invalid, False, 0)
+                continue
+            result, ok, ms = _run_tool(dispatch, tc["name"], args, "Tool")
+            wall_ms = ms
+            yield finish_tool(tc["id"], tc["name"], result, ok, ms)
+        return wall_ms
+
+    # Contexts are copied here, on the caller's thread: a copy made in a pool thread
+    # would hold that thread's variables, not the request's.
+    futures = {i: Future() for i in valid}
+    queue = deque((parsed[i][0]["name"], parsed[i][1], contextvars.copy_context(), futures[i]) for i in valid)
+    started = _now()
+    lanes = [_tool_pool.submit(_run_lane, queue, dispatch) for _ in range(min(tool_concurrency, len(valid)))]
+    last_end = started
+    try:
+        for i, (tc, _, invalid) in enumerate(parsed):
+            if invalid is not None:
+                yield finish_tool(tc["id"], tc["name"], invalid, False, 0)
+                continue
+            result, ok, ms, ended = futures[i].result()
+            last_end = max(last_end, ended)
+            yield finish_tool(tc["id"], tc["name"], result, ok, ms)
+    finally:
+        # Normally every call is done by now. If the consumer closed the stream early, don't
+        # block on calls still running: they finish in the background and are discarded,
+        # and the calls not started yet never start.
+        queue.clear()
+        for lane in lanes:
+            lane.cancel()
+    return _ms(last_end - started)
 
 
 _LENGTH_RETRY_PROMPT = (
@@ -347,6 +526,7 @@ def stream_chat(
     retry_reasoning_effort: str | None = None,
     pre_search: bool = False,
     llm_api: str = CHAT_COMPLETIONS,
+    tool_concurrency: int = DEFAULT_TOOL_CONCURRENCY,
 ) -> Iterator[ChatEvent]:
     """Run one user turn against ``domain`` and yield ``ChatEvent``s.
 
@@ -363,6 +543,11 @@ def stream_chat(
 
     ``llm_api``: ``"chat_completions"`` (the default) or ``"responses"``; see
     ``llm_api.py``. Either way the loop below sees chat-completions-shaped chunks.
+
+    ``tool_concurrency``: how many tool calls of one round may run at the same time
+    (``CHAT_TOOL_CONCURRENCY``); see ``_dispatch_round_concurrently``. ``1`` keeps the
+    sequential loop exactly: each call's ``ToolCallEvent`` then its ``ToolResultEvent``, one
+    call after another. A round with a single call always takes that path.
     """
     logger.info(
         "stream_chat: domain=%s user=%s message=%r (history length: %d)",
@@ -392,6 +577,7 @@ def stream_chat(
 
     all_citations: list[Citation] = []
     timer = _TurnTimer()
+    finish_tool = partial(_finish_tool, messages=messages, timer=timer, all_citations=all_citations)
     # Accumulated visible text for the *whole turn*, not just the last round.
     # A `TokenEvent` is emitted for every visible delta of every round, so a
     # client that concatenates tokens holds exactly this string; `DoneEvent.
@@ -417,19 +603,9 @@ def stream_chat(
             )
             yield ToolCallEvent(name=name, arguments=args)
             logger.info("Pre-search: %s(%s)", name, args)
-            tool_started = _now()
-            try:
-                result = domain.dispatch(name, args)
-                ok = True
-            except Exception as exc:  # broad on purpose: never crash the chat loop
-                logger.exception("Pre-search %s failed", name)
-                result = json.dumps({"error": f"Tool {name} failed: {exc}"})
-                ok = False
-            timer.record_tool(name, tool_started, ok)
-            citations = _extract_citations(result) if ok else []
-            all_citations.extend(citations)
-            messages.append({"role": "tool", "tool_call_id": call_id, "content": result})
-            yield ToolResultEvent(name=name, ok=ok, citations=citations)
+            result, ok, ms = _run_tool(domain.dispatch, name, args, "Pre-search")
+            timer.record_tool_phase(ms)
+            yield finish_tool(call_id, name, result, ok, ms)
 
         for round_num in range(max_tool_rounds + 1):
             call_started = _now()
@@ -562,38 +738,12 @@ def stream_chat(
                 assistant_msg["content"] = raw
             messages.append(assistant_msg)
 
-            # Dispatch each tool call and append its result.
-            for tc in tool_calls_acc.values():
-                try:
-                    args = json.loads(tc["arguments"] or "{}")
-                except json.JSONDecodeError as exc:
-                    yield ToolCallEvent(name=tc["name"], arguments={})
-                    timer.record_tool(tc["name"], _now(), ok=False)
-                    result = json.dumps({"error": f"Invalid arguments: {exc}"})
-                    messages.append(
-                        {"role": "tool", "tool_call_id": tc["id"], "content": result}
-                    )
-                    yield ToolResultEvent(name=tc["name"], ok=False, citations=[])
-                    continue
-
-                yield ToolCallEvent(name=tc["name"], arguments=args)
-                logger.info("Tool call: %s(%s)", tc["name"], args)
-                tool_started = _now()
-                try:
-                    result = domain.dispatch(tc["name"], args)
-                    ok = True
-                except Exception as exc:  # broad on purpose: never crash the chat loop
-                    logger.exception("Tool %s failed", tc["name"])
-                    result = json.dumps({"error": f"Tool {tc['name']} failed: {exc}"})
-                    ok = False
-                timer.record_tool(tc["name"], tool_started, ok)
-
-                citations = _extract_citations(result) if ok else []
-                all_citations.extend(citations)
-                messages.append(
-                    {"role": "tool", "tool_call_id": tc["id"], "content": result}
-                )
-                yield ToolResultEvent(name=tc["name"], ok=ok, citations=citations)
+            calls = list(tool_calls_acc.values())
+            if tool_concurrency > 1 and len(calls) > 1:
+                wall_ms = yield from _dispatch_round_concurrently(calls, domain.dispatch, tool_concurrency, finish_tool)
+            else:
+                wall_ms = yield from _dispatch_round_sequentially(calls, domain.dispatch, finish_tool)
+            timer.record_tool_phase(wall_ms)
     except OutputFiltered as exc:
         # The answer stopped partway: the tokens already sent are not a
         # complete answer, so end on an error rather than a DoneEvent.
