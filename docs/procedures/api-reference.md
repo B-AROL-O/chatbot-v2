@@ -111,8 +111,10 @@ Response is `text/event-stream` (via `sse-starlette`). Client renders
 #### Order of `tool_call` and `tool_result` events
 
 When the model asks for several tools in one round, the backend runs them
-concurrently, up to `CHAT_TOOL_CONCURRENCY` (default `4`) at a time. The round
-then sends every `tool_call` event first, followed by the `tool_result` events
+concurrently, up to `CHAT_TOOL_CONCURRENCY` (default `4`) at a time. The
+calls of these concurrent rounds share one pool of 8 threads across all
+requests, so they never use more than 8 threads however many requests are in
+flight. The round then sends every `tool_call` event first, followed by the `tool_result` events
 in the same order as the calls, whatever order the calls finish in:
 
 ```text

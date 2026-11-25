@@ -28,8 +28,9 @@ import contextvars
 import json
 import logging
 import time
+from collections import deque
 from collections.abc import Callable, Iterator
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
 from functools import partial
 
 from sme_chatbot.config import DEFAULT_TOOL_CONCURRENCY
@@ -302,6 +303,35 @@ def _dispatch_round_sequentially(calls: list[dict], dispatch, finish_tool: _Fini
         yield finish_tool(tc["id"], tc["name"], result, ok, ms)
 
 
+# The calls of every concurrent round, of every request, run on this one pool, so the
+# threads they use stay capped however many requests run, or disconnect and leave their
+# calls running. ``CHAT_TOOL_CONCURRENCY`` limits each round; this limits the process.
+# Both encoding and Chroma use the CPU, so more threads than this would gain little.
+# A ``ThreadPoolExecutor`` starts its threads on ``submit``, not here at import.
+_tool_pool = ThreadPoolExecutor(max_workers=8, thread_name_prefix="tool")
+
+
+def _run_lane(queue: deque, dispatch) -> None:
+    """Run calls from ``queue`` one at a time until it is empty; one lane per concurrent slot.
+
+    Each job is ``(name, args, context, future)``: the call runs in ``context`` and its
+    ``(result, ok, ms)`` goes to ``future``. Pulling from a shared queue refills a
+    slot as soon as any call of the round ends, without waiting for the loop's thread.
+    ``popleft`` is atomic, so lanes need no lock to share the queue.
+    """
+    while True:
+        try:
+            name, args, context, future = queue.popleft()
+        except IndexError:
+            return
+        try:
+            result, ok, ms = context.run(_run_tool, dispatch, name, args, "Tool")
+        except BaseException as exc:  # _run_tool catches Exception; never leave the loop waiting
+            future.set_exception(exc)
+            raise
+        future.set_result((result, ok, ms))
+
+
 def _dispatch_round_concurrently(
     calls: list[dict], dispatch, tool_concurrency: int, finish_tool: _FinishTool
 ) -> Iterator[ChatEvent]:
@@ -315,6 +345,9 @@ def _dispatch_round_concurrently(
     A call with invalid arguments is never dispatched. Each dispatched call runs in its own
     copy of the caller's context: one ``Context`` cannot be entered by two threads at once.
     With a single valid call there is nothing to overlap, and it runs inline.
+
+    The calls run on the shared ``_tool_pool``, in ``min(tool_concurrency, calls)``
+    lanes.
     """
     parsed = [(tc, *_parse_tool_arguments(tc["arguments"])) for tc in calls]
     for tc, args, invalid in parsed:
@@ -323,29 +356,34 @@ def _dispatch_round_concurrently(
             logger.info("Tool call: %s(%s)", tc["name"], args)
 
     valid = [i for i, (_, _, invalid) in enumerate(parsed) if invalid is None]
-    pool = None
-    if len(valid) > 1:
-        pool = ThreadPoolExecutor(max_workers=min(tool_concurrency, len(valid)), thread_name_prefix="tool")
-    try:
-        futures = {}
-        if pool is not None:
-            for i in valid:
-                tc, args, _ = parsed[i]
-                context = contextvars.copy_context()
-                futures[i] = pool.submit(context.run, _run_tool, dispatch, tc["name"], args, "Tool")
-        for i, (tc, args, invalid) in enumerate(parsed):
+    if len(valid) <= 1:
+        for tc, args, invalid in parsed:
             if invalid is not None:
-                result, ok, ms = invalid, False, 0
-            elif pool is None:
-                result, ok, ms = _run_tool(dispatch, tc["name"], args, "Tool")
-            else:
-                result, ok, ms = futures[i].result()
+                yield finish_tool(tc["id"], tc["name"], invalid, False, 0)
+                continue
+            result, ok, ms = _run_tool(dispatch, tc["name"], args, "Tool")
+            yield finish_tool(tc["id"], tc["name"], result, ok, ms)
+        return
+
+    # Contexts are copied here, on the caller's thread: a copy made in a pool thread
+    # would hold that thread's variables, not the request's.
+    futures = {i: Future() for i in valid}
+    queue = deque((parsed[i][0]["name"], parsed[i][1], contextvars.copy_context(), futures[i]) for i in valid)
+    lanes = [_tool_pool.submit(_run_lane, queue, dispatch) for _ in range(min(tool_concurrency, len(valid)))]
+    try:
+        for i, (tc, _, invalid) in enumerate(parsed):
+            if invalid is not None:
+                yield finish_tool(tc["id"], tc["name"], invalid, False, 0)
+                continue
+            result, ok, ms = futures[i].result()
             yield finish_tool(tc["id"], tc["name"], result, ok, ms)
     finally:
         # Normally every call is done by now. If the consumer closed the stream early, don't
-        # block on calls still running: they finish in the background and are discarded.
-        if pool is not None:
-            pool.shutdown(wait=False, cancel_futures=True)
+        # block on calls still running: they finish in the background and are discarded,
+        # and the calls not started yet never start.
+        queue.clear()
+        for lane in lanes:
+            lane.cancel()
 
 
 _LENGTH_RETRY_PROMPT = (

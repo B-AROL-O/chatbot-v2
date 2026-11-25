@@ -16,6 +16,7 @@ from __future__ import annotations
 import contextvars
 import json
 import threading
+from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
 
 import pytest
@@ -94,6 +95,13 @@ def make_domain(dispatch=None, tool_definitions=None) -> DomainConfig:
         system_prompt="You are a test assistant.",
         tool_definitions=tool_definitions or [],
         dispatch=dispatch or (lambda name, args: "{}"),
+    )
+
+
+def _stream(client, domain, message="hi", **kwargs):
+    """``stream_chat`` with the test defaults, not yet consumed."""
+    return stream_chat(
+        client, model="m", domain=domain, message=message, history=[], identity=RequestIdentity(user_id="u1"), **kwargs
     )
 
 
@@ -507,23 +515,31 @@ def test_a_single_call_runs_inline_on_the_loop_thread():
     assert threads == [threading.current_thread()]
 
 
+class _PeakRecordingDispatch:
+    """A dispatch whose calls each stay busy until ``all_calls`` run at once, or a short timeout.
+
+    So ``peak`` ends up exactly the number of calls that were let run together.
+    """
+
+    def __init__(self, all_calls):
+        self._all_running = threading.Condition()
+        self._all_calls = all_calls
+        self._active = 0
+        self.peak = 0
+
+    def __call__(self, name, args):
+        with self._all_running:
+            self._active += 1
+            self.peak = max(self.peak, self._active)
+            self._all_running.notify_all()
+            self._all_running.wait_for(lambda: self._active >= self._all_calls, timeout=0.3)
+            self._active -= 1
+        return "{}"
+
+
 @pytest.mark.parametrize(("tool_concurrency", "expected_peak"), [(2, 2), (3, 3)])
 def test_no_more_calls_run_at_once_than_tool_concurrency(tool_concurrency, expected_peak):
-    # Every call stays busy until all three are running at once, or a short timeout passes.
-    # So the peak reached is exactly the number of calls the pool lets run together.
-    all_running = threading.Condition()
-    active = 0
-    peak = 0
-
-    def dispatch(name, args):
-        nonlocal active, peak
-        with all_running:
-            active += 1
-            peak = max(peak, active)
-            all_running.notify_all()
-            all_running.wait_for(lambda: active >= 3, timeout=0.3)
-            active -= 1
-        return "{}"
+    dispatch = _PeakRecordingDispatch(all_calls=3)
 
     client = FakeStreamClient(
         [
@@ -538,7 +554,7 @@ def test_no_more_calls_run_at_once_than_tool_concurrency(tool_concurrency, expec
 
     events = run(client, dispatch=dispatch, tool_concurrency=tool_concurrency)
 
-    assert peak == expected_peak
+    assert dispatch.peak == expected_peak
     assert [e.ok for e in events if isinstance(e, ToolResultEvent)] == [True, True, True]
 
 
@@ -553,11 +569,7 @@ def test_closing_the_stream_mid_round_does_not_wait_for_a_running_call():
             b_finished.set()
         return "{}"
 
-    domain = make_domain(dispatch=dispatch)
-    stream = stream_chat(
-        FakeStreamClient(_two_call_round()), model="m", domain=domain, message="hi", history=[],
-        identity=RequestIdentity(user_id="u1"), tool_concurrency=4,
-    )
+    stream = _stream(FakeStreamClient(_two_call_round()), make_domain(dispatch=dispatch), tool_concurrency=4)
     first_result = next(e for e in stream if isinstance(e, ToolResultEvent))
     assert first_result.name == "search_a"
 
@@ -588,6 +600,71 @@ def test_concurrent_calls_see_the_callers_context_variables():
         _request_tag.reset(token)
 
     assert sorted(seen) == [("search_a", "req-42", False), ("search_b", "req-42", False)]
+
+
+@pytest.fixture()
+def tool_pool(monkeypatch):
+    """Swap the shared tool pool for a fresh one of the given size; shut down after the test."""
+    pools = []
+
+    def make(size):
+        pool = ThreadPoolExecutor(max_workers=size, thread_name_prefix="test-tool")
+        monkeypatch.setattr("sme_chatbot.core.chat._tool_pool", pool)
+        pools.append(pool)
+        return pool
+
+    yield make
+    for pool in pools:
+        pool.shutdown(wait=True)
+
+
+def test_the_tool_calls_of_all_requests_share_one_capped_pool(tool_pool):
+    """Two requests with two calls each, on a pool of 3: never 4 calls at once (review on #17)."""
+    tool_pool(3)
+    dispatch = _PeakRecordingDispatch(all_calls=4)
+
+    def one_request(_):
+        return run(FakeStreamClient(_two_call_round()), dispatch=dispatch, tool_concurrency=4)
+
+    with ThreadPoolExecutor(max_workers=2) as requests:
+        results = list(requests.map(one_request, range(2)))
+
+    assert dispatch.peak == 3
+    assert all(isinstance(events[-1], DoneEvent) for events in results)
+
+
+def test_closing_the_stream_mid_round_never_starts_the_calls_still_queued(tool_pool):
+    """The shared pool can't be shut down per round: the round's queued calls are dropped instead."""
+    pool = tool_pool(4)
+    release = threading.Event()
+    ran = []
+
+    def dispatch(name, args):
+        ran.append(name)
+        release.wait(timeout=5)
+        return "{}"
+
+    calls = [("x", "{oops"), ("a", "{}"), ("b", "{}"), ("c", "{}")]
+    client = FakeStreamClient(
+        [
+            [
+                make_chunk(tool_calls=[make_tool_call_delta(i, id_=f"call_{n}", name=f"search_{n}", arguments=a)])
+                for i, (n, a) in enumerate(calls)
+            ]
+            + [make_chunk(finish_reason="tool_calls")],
+            [make_chunk(content="ok"), make_chunk(finish_reason="stop")],
+        ]
+    )
+    stream = _stream(client, make_domain(dispatch=dispatch), tool_concurrency=2)
+    # The invalid call's result comes back at once, while a and b hold both slots.
+    first_result = next(e for e in stream if isinstance(e, ToolResultEvent))
+    assert (first_result.name, first_result.ok) == ("search_x", False)
+
+    stream.close()
+    release.set()
+    pool.shutdown(wait=True)
+
+    assert set(ran) <= {"search_a", "search_b"}
 
 
 # ---------------------------------------------------------------------------
@@ -1460,10 +1537,7 @@ def _pre_search_domain(dispatch):
 
 
 def _run_domain(client, domain, **kwargs):
-    return list(
-        stream_chat(client, model="m", domain=domain, message="Quanto pesa la 90001?", history=[],
-                    identity=RequestIdentity(user_id="u1"), **kwargs)
-    )
+    return list(_stream(client, domain, message="Quanto pesa la 90001?", **kwargs))
 
 
 def test_pre_search_runs_before_the_first_llm_call_as_a_tool_call_and_result():
